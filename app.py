@@ -59,6 +59,14 @@ try:
 except ImportError:
     winreg = None
 try:
+    import sspi
+except ImportError:
+    sspi = None
+try:
+    import truststore
+except ImportError:
+    truststore = None
+try:
     from windows_toasts import Toast, ToastButton, ToastDisplayImage, ToastDuration, ToastImagePosition, ToastScenario, WindowsToaster
 except ImportError:
     WindowsToaster = None
@@ -67,22 +75,40 @@ import tkinter as tk
 from tkinter import font as tkfont
 
 APP_FALLBACK_NAME = "Open Paging Server"
+APP_VERSION = "0.7.9"
 DESKTOP_CLIENT_HEADER = "x-ops-desktop-client"
+ENFORCED_AUTO_LOGIN_HEADER = "X-OPS-Enforced-Auto-Login"
 CLIENT_OS_HEADER = "X-OPS-Client-OS"
 EXTERNAL_BROWSER_SCHEMES = {"http", "https", "mailto", "tel"}
 CONFIG_DIR = Path(os.getenv("APPDATA") or Path.home()) / "OpenPagingServerClient"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+KERBEROS_LOG_FILE = CONFIG_DIR / "automatic-login.log"
+CONNECTION_LOG_FILE = CONFIG_DIR / "connection.log"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "OpenPagingServerClient"
+POLICY_KEY = r"Software\Policies\OpenPagingServer\DesktopClient"
+POLICY_VALUE_NAMES = {
+    "server_address": "ServerAddress",
+    "require_uac": "RequireUAC",
+    "launch_at_startup": "LaunchAtStartup",
+    "kerberos_auto_login_policy": "KerberosAutoLogin",
+}
 
-AUTOSTART_FLAG = "--autostart"
-AUTOSTART_ARG_VALUES = {"--autostart", "/autostart", "--minimized", "/minimized"}
+KERBEROS_POLICY_DISABLED = 0
+KERBEROS_POLICY_ALLOWED = 1
+KERBEROS_POLICY_ENFORCED = 2
+
+BACKGROUND_FLAG = "-background"
+BACKGROUND_ARG_VALUES = {
+    "-background", "--background", "/background",
+    "--autostart", "/autostart", "--minimized", "/minimized",
+}
 SINGLE_INSTANCE_MUTEX = "OpenPagingServerClient_SingleInstance_Mutex"
 SINGLE_INSTANCE_EVENT = "OpenPagingServerClient_ShowWindow_Event"
 
 COLOR_CONNECTED = "#2E7D32"
 COLOR_DISCONNECTED = "#C62828"
-COLOR_RECEIVING = "#FFB300"
+COLOR_RECEIVING = "#1976D2"
 COLOR_IDLE = "#9E9E9E"
 
 MB_YESNO = 0x4
@@ -107,10 +133,35 @@ FLASHW_TRAY = 0x00000002
 FLASHW_ALL = FLASHW_CAPTION | FLASHW_TRAY
 FLASHW_TIMERNOFG = 0x0000000C
 
-# Per-window DPI awareness context handle; -1 == DPI_AWARENESS_CONTEXT_UNAWARE.
 DPI_AWARENESS_CONTEXT_UNAWARE = -1
 _popup_proc_refs: list = []
 _dpi_proc_refs: list = []
+
+
+def kerberos_log(message):
+    """Write bounded diagnostics without recording tickets, tokens, or keys."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if KERBEROS_LOG_FILE.exists() and KERBEROS_LOG_FILE.stat().st_size > 128 * 1024:
+            KERBEROS_LOG_FILE.replace(KERBEROS_LOG_FILE.with_suffix(".log.old"))
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with KERBEROS_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {str(message or '')[:1000]}\n")
+    except Exception:
+        pass
+
+
+def connection_log(message):
+    """Write bounded connection diagnostics without recording credentials."""
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if CONNECTION_LOG_FILE.exists() and CONNECTION_LOG_FILE.stat().st_size > 128 * 1024:
+            CONNECTION_LOG_FILE.replace(CONNECTION_LOG_FILE.with_suffix(".log.old"))
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with CONNECTION_LOG_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(f"{timestamp} {str(message or '')[:1000]}\n")
+    except Exception:
+        pass
 _dpi_hooked_hwnds: set = set()
 _SINGLE_INSTANCE_HANDLES: list = []
 
@@ -222,6 +273,68 @@ def save_config(data):
         CONFIG_FILE.write_text(json.dumps(data), encoding="utf-8")
     except Exception:
         pass
+
+
+def _read_policy_value(root, value_name):
+    if winreg is None:
+        return None, False
+    access_modes = [winreg.KEY_READ]
+    if hasattr(winreg, "KEY_WOW64_64KEY"):
+        access_modes.insert(0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+    if hasattr(winreg, "KEY_WOW64_32KEY"):
+        access_modes.append(winreg.KEY_READ | winreg.KEY_WOW64_32KEY)
+    for access in access_modes:
+        try:
+            with winreg.OpenKey(root, POLICY_KEY, 0, access) as key:
+                value, _kind = winreg.QueryValueEx(key, value_name)
+                return value, True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return None, False
+
+
+def _policy_bool(value):
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disabled"}:
+            return False
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def load_group_policy():
+    """Read effective Windows policies. Computer policy wins over user policy."""
+    policies = {}
+    if winreg is None:
+        return policies
+    roots = (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER)
+    for setting, value_name in POLICY_VALUE_NAMES.items():
+        for root in roots:
+            value, exists = _read_policy_value(root, value_name)
+            if not exists:
+                continue
+            if setting == "server_address":
+                value = str(value or "").strip()
+                if not value:
+                    break
+            elif setting == "kerberos_auto_login_policy":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    value = KERBEROS_POLICY_ALLOWED
+                if value not in {KERBEROS_POLICY_DISABLED, KERBEROS_POLICY_ALLOWED, KERBEROS_POLICY_ENFORCED}:
+                    value = KERBEROS_POLICY_ALLOWED
+            else:
+                value = _policy_bool(value)
+            policies[setting] = value
+            break
+    return policies
 
 
 def system_uses_dark_mode():
@@ -508,14 +621,14 @@ def virtual_screen_bounds():
 
 def startup_command():
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" {AUTOSTART_FLAG}'
+        return f'"{sys.executable}" {BACKGROUND_FLAG}'
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     interpreter = str(pythonw if pythonw.is_file() else sys.executable)
-    return f'"{interpreter}" "{Path(__file__).resolve()}" {AUTOSTART_FLAG}'
+    return f'"{interpreter}" "{Path(__file__).resolve()}" {BACKGROUND_FLAG}'
 
 
 def launched_at_startup():
-    return any(str(arg).strip().lower() in AUTOSTART_ARG_VALUES for arg in sys.argv[1:])
+    return any(str(arg).strip().lower() in BACKGROUND_ARG_VALUES for arg in sys.argv[1:])
 
 
 def _acquire_single_instance():
@@ -527,7 +640,7 @@ def _acquire_single_instance():
         kernel32.CreateMutexW.restype = wintypes.HANDLE
         kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
         handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX)
-        already_running = ctypes.get_last_error() == 183 or kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+        already_running = ctypes.get_last_error() == 183 or kernel32.GetLastError() == 183
         return (not already_running), handle
     except Exception:
         return True, None
@@ -541,7 +654,6 @@ def create_show_event():
         kernel32 = ctypes.windll.kernel32
         kernel32.CreateEventW.restype = wintypes.HANDLE
         kernel32.CreateEventW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.BOOL, wintypes.LPCWSTR]
-        # CreateEventW(security, manual_reset=False, initial_state=False, name)
         return kernel32.CreateEventW(None, False, False, SINGLE_INSTANCE_EVENT)
     except Exception:
         return None
@@ -568,20 +680,58 @@ def signal_existing_instance():
     return False
 
 
+def startup_registry_value(root):
+    if winreg is None:
+        return ""
+    access_modes = [winreg.KEY_READ]
+    if hasattr(winreg, "KEY_WOW64_64KEY"):
+        access_modes.insert(0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+    if hasattr(winreg, "KEY_WOW64_32KEY"):
+        access_modes.append(winreg.KEY_READ | winreg.KEY_WOW64_32KEY)
+    for access in access_modes:
+        try:
+            with winreg.OpenKey(root, RUN_KEY, 0, access) as key:
+                value, _kind = winreg.QueryValueEx(key, RUN_VALUE)
+                return str(value or "")
+        except Exception:
+            continue
+    return ""
+
+
 def startup_enabled():
     if winreg is None:
         return False
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY)
-        winreg.QueryValueEx(key, RUN_VALUE)
-        winreg.CloseKey(key)
-        return True
-    except Exception:
-        return False
+    return bool(
+        startup_registry_value(winreg.HKEY_CURRENT_USER)
+        or startup_registry_value(winreg.HKEY_LOCAL_MACHINE)
+    )
+
+
+def remove_redundant_user_startup_entry():
+    """A machine Run entry already starts this user; avoid a second launch."""
+    if winreg is None or not startup_registry_value(winreg.HKEY_LOCAL_MACHINE):
+        return
+    access_modes = [winreg.KEY_SET_VALUE]
+    if hasattr(winreg, "KEY_WOW64_64KEY"):
+        access_modes.insert(0, winreg.KEY_SET_VALUE | winreg.KEY_WOW64_64KEY)
+    if hasattr(winreg, "KEY_WOW64_32KEY"):
+        access_modes.append(winreg.KEY_SET_VALUE | winreg.KEY_WOW64_32KEY)
+    for access in access_modes:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, access) as key:
+                try:
+                    winreg.DeleteValue(key, RUN_VALUE)
+                except FileNotFoundError:
+                    pass
+        except Exception:
+            continue
 
 
 def set_startup_enabled(enabled):
     if winreg is None:
+        return
+    if enabled and startup_registry_value(winreg.HKEY_LOCAL_MACHINE):
+        remove_redundant_user_startup_entry()
         return
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE)
@@ -597,15 +747,25 @@ def set_startup_enabled(enabled):
         pass
 
 
+def system_ssl_context():
+    # On Windows this delegates chain building, missing-intermediate fetching,
+    # revocation, hostname checks, and enterprise policy to CryptoAPI—the same
+    # system trust source used by WebView2 and Edge.
+    if os.name == "nt" and truststore is not None:
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
+
+
 def request_ssl_context(url):
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https":
         return None
-    context = ssl.create_default_context()
     if parsed.hostname in INSECURE_HOSTS:
+        context = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-    return context
+        return context
+    return system_ssl_context()
 
 
 def http_json(origin, path, method="GET", token="", body=None, timeout=10, extra_headers=None):
@@ -658,17 +818,49 @@ def validate_server_info_payload(info):
     return payload
 
 
-def probe_server(text, confirm_http=None, confirm_cert=None):
+def server_address_candidates(text):
     raw = str(text or "").strip().rstrip("/")
     if not raw:
         raise ValueError("Please enter a server address.")
-    if "://" in raw:
-        candidates = [raw]
+
+    has_scheme = "://" in raw
+    parsed = urllib.parse.urlsplit(raw if has_scheme else "//" + raw)
+    scheme = str(parsed.scheme or "").lower()
+    if has_scheme and scheme not in {"http", "https"}:
+        raise ValueError("The server address must use HTTP or HTTPS.")
+    if not parsed.hostname:
+        raise ValueError("Please enter a valid server address.")
+    if parsed.username or parsed.password:
+        raise ValueError("The server address cannot contain credentials.")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("Enter only the server name or address, without a path.")
+    try:
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Please enter a valid server port.") from exc
+
+    hostname = parsed.hostname
+    formatted_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+    if explicit_port is not None:
+        schemes = [scheme] if has_scheme else ["https", "http"]
+        endpoints = [(candidate_scheme, explicit_port) for candidate_scheme in schemes]
+    elif has_scheme:
+        endpoints = [(scheme, 443), (scheme, 8443)] if scheme == "https" else [(scheme, 80), (scheme, 8080)]
     else:
-        parsed_raw = urllib.parse.urlparse("//" + raw)
-        candidates = ["https://" + raw]
-        if parsed_raw.port != 443:
-            candidates.append("http://" + raw)
+        endpoints = [("https", 443), ("https", 8443), ("http", 80), ("http", 8080)]
+
+    candidates = []
+    for candidate_scheme, port in endpoints:
+        default_port = 443 if candidate_scheme == "https" else 80
+        port_suffix = "" if port == default_port else f":{port}"
+        candidate = f"{candidate_scheme}://{formatted_host}{port_suffix}"
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def probe_server(text, confirm_http=None, confirm_cert=None):
+    candidates = server_address_candidates(text)
     last_error = None
     for base in candidates:
         host = urllib.parse.urlparse(base).hostname or ""
@@ -676,7 +868,7 @@ def probe_server(text, confirm_http=None, confirm_cert=None):
         while attempt < 2:
             attempt += 1
             try:
-                info, final_url = http_json(base, "/desktop/server-info")
+                info, final_url = http_json(base, "/desktop/server-info", timeout=5)
             except Exception as exc:
                 if _is_cert_error(exc) and host and host not in INSECURE_HOSTS:
                     if confirm_cert is not None and confirm_cert(host):
@@ -1184,10 +1376,7 @@ class WebSocketClient:
         except Exception:
             pass
         if secure:
-            context = ssl.create_default_context()
-            if host in INSECURE_HOSTS:
-                context.check_hostname = False
-                context.verify_mode = ssl.CERT_NONE
+            context = request_ssl_context(self.origin)
             raw = context.wrap_socket(raw, server_hostname=host)
         key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
         handshake = (
@@ -1336,6 +1525,41 @@ def desktop_token_identity(token):
         str(payload.get("role") or "").strip().lower(),
         str(payload.get("sid") or payload.get("session_id") or "").strip(),
     )
+
+
+def desktop_token_expires_at(token):
+    raw = str(token or "").strip()
+    if "." not in raw:
+        return 0
+    payload_b64 = raw.rsplit(".", 1)[0]
+    padding = "=" * (-len(payload_b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode((payload_b64 + padding).encode("ascii")).decode("utf-8"))
+        return int(payload.get("exp") or 0)
+    except Exception:
+        return 0
+
+
+def acquire_windows_kerberos_token(spn):
+    if os.name != "nt" or sspi is None:
+        raise RuntimeError("Windows Automatic Login support is unavailable")
+    target = str(spn or "").strip()
+    if not target or any(character.isspace() for character in target):
+        raise ValueError("Invalid Automatic Login service principal")
+    auth = sspi.ClientAuth("Kerberos", targetspn=target)
+    _status, buffers = auth.authorize(None)
+    token = bytes(buffers[0].Buffer) if buffers and buffers[0].Buffer else b""
+    if not token:
+        raise RuntimeError("No Automatic Login credentials are available")
+    return auth, base64.b64encode(token).decode("ascii")
+
+
+def finish_windows_kerberos_exchange(auth, encoded_token):
+    token = str(encoded_token or "").strip()
+    if not token:
+        return
+    raw = base64.b64decode(token, validate=True)
+    auth.authorize(raw)
 
 
 def text_color_for(color):
@@ -1626,7 +1850,6 @@ INJECT_JS = r"""
 })();
 """
 
-
 class ToastCenter:
     def __init__(self, app):
         self.app = app
@@ -1682,13 +1905,6 @@ class ToastCenter:
         threading.Thread(target=_show_in_thread, daemon=True).start()
 
 
-# All Tk dialogs run on this single, long-lived thread. Creating tk.Tk() roots on
-# several different threads (the startup dialog on the main thread, later dialogs
-# on assorted worker threads) is what triggered the fatal
-# "Tcl_AsyncDelete: async handler deleted by the wrong thread" abort, which then
-# surfaced downstream as bogus "not enough free memory for image buffer" errors.
-# Funnelling every dialog through one thread makes all Tcl interpreters be created
-# and destroyed on the same thread, which is safe.
 _tk_dispatch_queue = queue.Queue()
 _tk_dispatch_thread = None
 _tk_dispatch_lock = threading.Lock()
@@ -1719,7 +1935,7 @@ def _tk_dispatch_loop():
         fn, result_holder, done = _tk_dispatch_queue.get()
         try:
             result_holder["value"] = fn()
-        except Exception as exc:  # noqa: BLE001 - surfaced to the caller
+        except Exception as exc:
             result_holder["error"] = exc
         finally:
             if done is not None:
@@ -1790,6 +2006,51 @@ def _apply_tk_dpi_geometry(root, base_w, base_h):
     y = (root.winfo_screenheight() - h) // 2
     root.geometry(f"{w}x{h}+{x}+{y}")
     return scale
+
+
+def add_tooltip(widget, text):
+    popup = {"window": None}
+
+    def hide(_event=None):
+        window = popup.pop("window", None)
+        popup["window"] = None
+        if window is not None:
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+    def show(_event=None):
+        if popup.get("window") is not None:
+            return
+        try:
+            window = tk.Toplevel(widget)
+            popup["window"] = window
+            window.wm_overrideredirect(True)
+            window.attributes("-topmost", True)
+            x = widget.winfo_pointerx() + 12
+            y = widget.winfo_pointery() + 18
+            window.wm_geometry(f"+{x}+{y}")
+            tk.Label(
+                window, text=text, bg="#FFFDE7", fg="#212121",
+                relief="solid", borderwidth=1,
+                font=tkfont.Font(family="Segoe UI", size=9), padx=7, pady=4,
+            ).pack()
+        except Exception:
+            hide()
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<ButtonPress>", hide, add="+")
+
+
+def managed_briefcase(parent, bg):
+    icon = tk.Label(
+        parent, text="\U0001F4BC", bg=bg, fg="#777777",
+        font=tkfont.Font(family="Segoe UI Emoji", size=11), cursor="question_arrow",
+    )
+    add_tooltip(icon, "Managed by your administrator")
+    return icon
 
 
 def _flash_window(hwnd, count=5):
@@ -1904,7 +2165,17 @@ class ServerAddressDialog:
         entry_font = tkfont.Font(family="Segoe UI", size=12)
         button_font = tkfont.Font(family="Segoe UI", size=11, weight="bold")
 
-        tk.Label(root, text="Server Address", bg=bg, fg=fg, font=label_font).pack(pady=(6, 8))
+        server_managed = "server_address" in self.app.policies
+        server_value = str(
+            self.app.policies.get("server_address")
+            or self.app.config.get("server_input")
+            or ""
+        )
+        server_label_row = tk.Frame(root, bg=bg)
+        server_label_row.pack(pady=(6, 8))
+        tk.Label(server_label_row, text="Server Address", bg=bg, fg=fg, font=label_font).pack(side="left")
+        if server_managed:
+            managed_briefcase(server_label_row, bg).pack(side="left", padx=(5, 0))
 
         entry_frame = tk.Frame(root, bg=accent, padx=0, pady=0)
         entry_frame.pack()
@@ -1915,8 +2186,11 @@ class ServerAddressDialog:
             insertbackground=fg, relief="flat", justify="center",
         )
         entry.pack(ipady=8, padx=2, pady=2)
-        entry.insert(0, str(self.app.config.get("server_input") or ""))
-        entry.focus_set()
+        entry.insert(0, server_value)
+        if server_managed:
+            entry.configure(state="disabled", disabledbackground="#D0D0D0", disabledforeground="#666666")
+        else:
+            entry.focus_set()
 
         error_label = tk.Label(root, text="", bg=bg, fg="#E53935", font=label_font, wraplength=360, justify="center")
         error_label.pack(pady=(10, 0))
@@ -1925,7 +2199,7 @@ class ServerAddressDialog:
         status_label.pack(pady=(2, 0))
 
         def do_login():
-            value = entry.get().strip()
+            value = server_value if server_managed else entry.get().strip()
             if not value:
                 error_label.configure(text="Please enter a server address.")
                 return
@@ -1973,7 +2247,7 @@ class ServerAddressDialog:
         )
         login_button.pack(pady=(22, 0))
 
-        if self.app.config.get("server"):
+        if self.app.config.get("server") and not server_managed:
             def do_disconnect():
                 self.app.disconnect_from_server()
                 error_label.configure(text="")
@@ -1993,10 +2267,9 @@ class ServerAddressDialog:
         try:
             root.mainloop()
         finally:
-            # Join any in-flight connect worker before tearing down the Tk objects.
             for worker_thread in worker_threads:
                 try:
-                    worker_thread.join()
+                    worker_thread.join(timeout=0.1)
                 except Exception:
                     pass
             try:
@@ -2019,7 +2292,233 @@ class AppSettingsWindow:
     def run(self):
         if not self.app.origin:
             return
-        if self.app.config.get("require_uac") and not uac_approved():
+        require_uac = bool(self.app.policies.get("require_uac", self.app.config.get("require_uac")))
+        if require_uac and not uac_approved():
+            return
+
+        dark = system_uses_dark_mode()
+        bg = "#1F1F1F" if dark else "#F7F8FA"
+        card_bg = "#292929" if dark else "#FFFFFF"
+        fg = "#F2F2F2" if dark else "#1A1A1A"
+        subtle = "#B0B0B0" if dark else "#60646C"
+        border = "#3A3A3A" if dark else "#DADDE3"
+        accent = "#1976D2"
+        red = "#C62828"
+        closed = False
+        self.action = None
+
+        root = _create_dialog_tk_root()
+        root.title("App Settings")
+        root.configure(bg=bg)
+        root.geometry("500x580")
+        root.resizable(False, False)
+        try:
+            root.iconbitmap(app_ico_path())
+        except Exception:
+            pass
+        root.update_idletasks()
+        try:
+            apply_dark_titlebar(ctypes.windll.user32.GetParent(root.winfo_id()), dark)
+        except Exception:
+            pass
+        _apply_tk_dpi_geometry(root, 500, 580)
+
+        def close():
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            try:
+                root.quit()
+            except Exception:
+                pass
+
+        normal_font = tkfont.Font(family="Segoe UI", size=10)
+        button_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        tab_bar = tk.Frame(root, bg=border, height=44)
+        tab_bar.pack(fill="x", side="top")
+        tab_bar.grid_columnconfigure(0, weight=1, uniform="settings-tabs")
+        tab_bar.grid_columnconfigure(1, weight=1, uniform="settings-tabs")
+
+        content = tk.Frame(root, bg=bg)
+        content.pack(fill="both", expand=True, padx=20, pady=(0, 18))
+        general = tk.Frame(content, bg=bg)
+        about = tk.Frame(content, bg=bg)
+        tabs = {}
+
+        def select_tab(name):
+            for tab_name, frame in (("general", general), ("about", about)):
+                if tab_name == name:
+                    frame.pack(fill="both", expand=True)
+                    tabs[tab_name].configure(bg=accent, fg="#FFFFFF")
+                else:
+                    frame.pack_forget()
+                    tabs[tab_name].configure(bg=card_bg, fg=fg)
+
+        tabs["general"] = tk.Button(
+            tab_bar, text="General", command=lambda: select_tab("general"),
+            bg=card_bg, fg=fg, activebackground=accent, activeforeground="#FFFFFF",
+            relief="flat", borderwidth=0, highlightthickness=0, cursor="hand2",
+            font=button_font, pady=11,
+        )
+        tabs["about"] = tk.Button(
+            tab_bar, text="About", command=lambda: select_tab("about"),
+            bg=card_bg, fg=fg, activebackground=accent, activeforeground="#FFFFFF",
+            relief="flat", borderwidth=0, highlightthickness=0, cursor="hand2",
+            font=button_font, pady=11,
+        )
+        tabs["general"].grid(row=0, column=0, sticky="nsew", padx=(0, 1))
+        tabs["about"].grid(row=0, column=1, sticky="nsew", padx=(1, 0))
+        select_tab("general")
+
+        general_card = tk.Frame(general, bg=card_bg, highlightbackground=border, highlightthickness=1)
+        general_card.pack(fill="x", padx=8, pady=(18, 12))
+
+        server_managed = "server_address" in self.app.policies
+        startup_managed = "launch_at_startup" in self.app.policies
+        uac_managed = "require_uac" in self.app.policies
+        kerberos_managed = "kerberos_auto_login_policy" in self.app.policies
+        server_address = str(
+            self.app.policies.get("server_address")
+            or self.app.config.get("server_input")
+            or self.app.origin
+            or ""
+        )
+
+        tk.Label(general_card, text="SERVER", bg=card_bg, fg=subtle, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=18, pady=(15, 4))
+        server_row = tk.Frame(general_card, bg=card_bg)
+        server_row.pack(fill="x", padx=18, pady=(0, 14))
+        tk.Label(server_row, text=server_address, bg=card_bg, fg=fg, font=normal_font, wraplength=385, justify="left").pack(side="left", anchor="w")
+        if server_managed:
+            managed_briefcase(server_row, card_bg).pack(side="left", padx=(7, 0))
+
+        tk.Frame(general_card, bg=border, height=1).pack(fill="x", padx=18)
+        tk.Label(general_card, text="CLIENT", bg=card_bg, fg=subtle, font=("Segoe UI", 8, "bold")).pack(anchor="w", padx=18, pady=(14, 5))
+
+        startup_var = tk.BooleanVar(value=bool(self.app.policies.get("launch_at_startup", startup_enabled())))
+        uac_var = tk.BooleanVar(value=bool(self.app.policies.get("require_uac", self.app.config.get("require_uac"))))
+
+        def update_startup():
+            if not startup_managed:
+                set_startup_enabled(bool(startup_var.get()))
+
+        def update_uac():
+            if not uac_managed:
+                self.app.config["require_uac"] = bool(uac_var.get())
+                save_config(self.app.config)
+
+        def checkbox_row(text, variable, command, managed):
+            row = tk.Frame(general_card, bg=card_bg)
+            row.pack(fill="x", padx=14, pady=3)
+            box = tk.Checkbutton(
+                row, text=text, variable=variable, command=command,
+                bg=card_bg, fg=fg, activebackground=card_bg, activeforeground=fg,
+                selectcolor=card_bg, disabledforeground=subtle, font=normal_font,
+                cursor="arrow" if managed else "hand2", anchor="w",
+            )
+            box.pack(side="left")
+            if managed:
+                box.configure(state="disabled")
+                managed_briefcase(row, card_bg).pack(side="left", padx=(5, 0))
+
+        checkbox_row("Launch at startup", startup_var, update_startup, startup_managed)
+        checkbox_row("Require administrator for App Settings", uac_var, update_uac, uac_managed)
+
+        if kerberos_managed:
+            kerberos_names = {
+                KERBEROS_POLICY_DISABLED: "Disabled",
+                KERBEROS_POLICY_ALLOWED: "Allowed",
+                KERBEROS_POLICY_ENFORCED: "Enforced",
+            }
+            kerberos_row = tk.Frame(general_card, bg=card_bg)
+            kerberos_row.pack(fill="x", padx=18, pady=(8, 15))
+            tk.Label(
+                kerberos_row,
+                text="Automatic Login: " + kerberos_names.get(self.app.kerberos_policy_mode, "Allowed"),
+                bg=card_bg, fg=fg, font=normal_font,
+            ).pack(side="left")
+            managed_briefcase(kerberos_row, card_bg).pack(side="left", padx=(6, 0))
+        else:
+            tk.Frame(general_card, bg=card_bg, height=10).pack()
+
+        def do_disconnect():
+            answer = native_message_box(
+                self.app.product_name,
+                "Disconnect from the server? You will stop receiving messages until you connect again.",
+                MB_YESNO | MB_ICONQUESTION,
+            )
+            if answer == IDYES:
+                self.action = "disconnect"
+                close()
+
+        def do_exit_client():
+            answer = native_message_box(
+                self.app.product_name,
+                "Exit the client? You will not receive pages or emergency notifications while it is closed.",
+                MB_YESNO | MB_ICONWARNING,
+            )
+            if answer == IDYES:
+                close()
+                self.app.quit()
+
+        action_row = tk.Frame(general, bg=bg)
+        action_row.pack(pady=(5, 0))
+        if not server_managed:
+            tk.Button(
+                action_row, text="DISCONNECT FROM SERVER", command=do_disconnect,
+                bg=accent, fg="#FFFFFF", activebackground="#1565C0", activeforeground="#FFFFFF",
+                relief="flat", cursor="hand2", padx=16, pady=9, borderwidth=0, font=button_font,
+            ).pack(side="left", padx=6)
+        tk.Button(
+            action_row, text="EXIT CLIENT", command=do_exit_client,
+            bg=red, fg="#FFFFFF", activebackground="#B71C1C", activeforeground="#FFFFFF",
+            relief="flat", cursor="hand2", padx=18, pady=9, borderwidth=0, font=button_font,
+        ).pack(side="left", padx=6)
+
+        logo_data = logo_png_bytes(dark)
+        logo_image = tk.PhotoImage(data=base64.b64encode(logo_data).decode("ascii"))
+        factor = max(1, logo_image.width() // 230)
+        if factor > 1:
+            logo_image = logo_image.subsample(factor, factor)
+        logo_label = tk.Label(about, image=logo_image, bg=bg, borderwidth=0)
+        logo_label.image = logo_image
+        logo_label.pack(pady=(18, 8))
+        tk.Label(
+            about, text=f"Open Paging Server Desktop Client {APP_VERSION}",
+            bg=bg, fg=fg, font=("Segoe UI", 10, "bold"),
+        ).pack(pady=(0, 12))
+        tk.Label(
+            about,
+            text="Open Paging Server is licensed under the GNU General Public License v2.0. Third-party components, modules, and software used by Open Paging Server are subject to their own licenses.",
+            bg=bg, fg=subtle, font=("Segoe UI", 9), wraplength=405, justify="center",
+        ).pack(padx=18, pady=(0, 12))
+        tk.Label(
+            about,
+            text="Open Paging Server is provided \"as is\" without any warranties, express or implied, including but not limited to fitness for a particular purpose or non-infringement.",
+            bg=bg, fg=subtle, font=("Segoe UI", 9), wraplength=405, justify="center",
+        ).pack(padx=18)
+
+        root.protocol("WM_DELETE_WINDOW", close)
+        try:
+            root.mainloop()
+        finally:
+            try:
+                logo_label.configure(image="")
+                logo_label.image = None
+            except Exception:
+                pass
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            _tk_dead_roots.append(root)
+        return self.action
+
+    def _run_legacy(self):
+        if not self.app.origin:
+            return
+        require_uac = bool(self.app.policies.get("require_uac", self.app.config.get("require_uac")))
+        if require_uac and not uac_approved():
             return
         dark = system_uses_dark_mode()
         bg = "#1F1F1F" if dark else "#FFFFFF"
@@ -2033,7 +2532,7 @@ class AppSettingsWindow:
         root = _create_dialog_tk_root()
         root.title("App Settings")
         root.configure(bg=bg)
-        root.geometry("380x580")
+        root.geometry("420x640")
         root.resizable(False, False)
         try:
             root.iconbitmap(app_ico_path())
@@ -2044,7 +2543,7 @@ class AppSettingsWindow:
             apply_dark_titlebar(ctypes.windll.user32.GetParent(root.winfo_id()), dark)
         except Exception:
             pass
-        _apply_tk_dpi_geometry(root, 380, 580)
+        _apply_tk_dpi_geometry(root, 420, 640)
 
         def close():
             nonlocal closed
@@ -2061,7 +2560,7 @@ class AppSettingsWindow:
         info_font = tkfont.Font(family="Segoe UI", size=9)
         tk.Label(
             root,
-            text="Open Paging Server Desktop Client 0.1.0",
+            text=f"Open Paging Server Desktop Client {APP_VERSION}",
             bg=bg, fg=fg, font=tkfont.Font(family="Segoe UI", size=9, weight="bold"),
             wraplength=340, justify="center",
         ).pack(padx=20, pady=(0, 8))
@@ -2078,8 +2577,26 @@ class AppSettingsWindow:
 
         button_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
         normal_font = tkfont.Font(family="Segoe UI", size=11)
-        startup_state = [startup_enabled()]
-        uac_state = [bool(self.app.config.get("require_uac"))]
+        server_managed = "server_address" in self.app.policies
+        startup_managed = "launch_at_startup" in self.app.policies
+        uac_managed = "require_uac" in self.app.policies
+        server_address = str(
+            self.app.policies.get("server_address")
+            or self.app.config.get("server_input")
+            or self.app.origin
+            or ""
+        )
+        startup_state = [bool(self.app.policies.get("launch_at_startup", startup_enabled()))]
+        uac_state = [bool(self.app.policies.get("require_uac", self.app.config.get("require_uac")))]
+
+        server_row = tk.Frame(root, bg=bg)
+        server_row.pack(padx=24, pady=(0, 12))
+        tk.Label(
+            server_row, text=f"Server Address: {server_address}", bg=bg, fg=fg,
+            font=normal_font, wraplength=350, justify="center",
+        ).pack(side="left")
+        if server_managed:
+            managed_briefcase(server_row, bg).pack(side="left", padx=(5, 0))
 
         def startup_text():
             return "Launch at startup: " + ("On" if startup_state[0] else "Off")
@@ -2088,29 +2605,46 @@ class AppSettingsWindow:
             return "Require UAC for App Settings: " + ("On" if uac_state[0] else "Off")
 
         def toggle_startup():
+            if startup_managed:
+                return
             startup_state[0] = not startup_state[0]
             set_startup_enabled(startup_state[0])
             startup_button.configure(text=startup_text())
 
         def toggle_uac():
+            if uac_managed:
+                return
             uac_state[0] = not uac_state[0]
             self.app.config["require_uac"] = bool(uac_state[0])
             save_config(self.app.config)
             uac_button.configure(text=uac_text())
 
-        startup_button = tk.Button(
-            root, text=startup_text(), command=toggle_startup,
-            bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
-            relief="groove", cursor="hand2", padx=16, pady=7, borderwidth=1, font=normal_font,
-        )
-        startup_button.pack(pady=(0, 10))
+        def pack_setting_button(button, managed, bottom_padding):
+            row = button.master
+            row.pack(pady=(0, bottom_padding))
+            button.pack(side="left")
+            if managed:
+                button.configure(
+                    state="disabled", bg="#C8C8C8", fg="#707070",
+                    disabledforeground="#707070", relief="groove", cursor="arrow",
+                )
+                managed_briefcase(row, bg).pack(side="left", padx=(6, 0))
 
-        uac_button = tk.Button(
-            root, text=uac_text(), command=toggle_uac,
+        startup_row = tk.Frame(root, bg=bg)
+        startup_button = tk.Button(
+            startup_row, text=startup_text(), command=toggle_startup,
             bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
             relief="groove", cursor="hand2", padx=16, pady=7, borderwidth=1, font=normal_font,
         )
-        uac_button.pack(pady=(0, 18))
+        pack_setting_button(startup_button, startup_managed, 10)
+
+        uac_row = tk.Frame(root, bg=bg)
+        uac_button = tk.Button(
+            uac_row, text=uac_text(), command=toggle_uac,
+            bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+            relief="groove", cursor="hand2", padx=16, pady=7, borderwidth=1, font=normal_font,
+        )
+        pack_setting_button(uac_button, uac_managed, 18)
 
         def do_disconnect():
             answer = native_message_box(
@@ -2119,11 +2653,6 @@ class AppSettingsWindow:
                 MB_YESNO | MB_ICONQUESTION,
             )
             if answer == IDYES:
-                # Defer the actual disconnect/server-dialog until run() has
-                # returned and open_app_settings() has released tk_lock. Doing it
-                # here would spawn show_server_dialog() while this window still
-                # holds tk_lock, so its non-blocking acquire fails and the server
-                # address page never appears (app appears hung until restart).
                 self.action = "disconnect"
                 close()
 
@@ -2137,11 +2666,12 @@ class AppSettingsWindow:
                 close()
                 self.app.quit()
 
-        tk.Button(
-            root, text="DISCONNECT FROM SERVER", command=do_disconnect,
-            bg=accent, fg="#FFFFFF", activebackground="#1565C0", activeforeground="#FFFFFF",
-            relief="flat", cursor="hand2", padx=20, pady=8, borderwidth=0, font=button_font,
-        ).pack(pady=(0, 12))
+        if not server_managed:
+            tk.Button(
+                root, text="DISCONNECT FROM SERVER", command=do_disconnect,
+                bg=accent, fg="#FFFFFF", activebackground="#1565C0", activeforeground="#FFFFFF",
+                relief="flat", cursor="hand2", padx=20, pady=8, borderwidth=0, font=button_font,
+            ).pack(pady=(0, 12))
         tk.Button(
             root, text="CLOSE CLIENT", command=do_close_client,
             bg=red, fg="#FFFFFF", activebackground="#B71C1C", activeforeground="#FFFFFF",
@@ -2175,8 +2705,6 @@ class DesktopSsoWindow:
         if self._started:
             return
         self._started = True
-        # Run on the shared Tk dialog thread (non-blocking) so this window shares
-        # the single Tcl interpreter thread with every other dialog.
         run_on_tk_thread(self.run, block=False)
 
     def enqueue(self, callback):
@@ -2193,8 +2721,6 @@ class DesktopSsoWindow:
             try:
                 root.deiconify()
                 root.lift()
-                # Keep the prompt persistently on top (do not drop -topmost) so it
-                # can't be lost behind the browser window opened for SSO.
                 root.attributes("-topmost", True)
                 root.focus_force()
             except Exception:
@@ -2240,7 +2766,6 @@ class DesktopSsoWindow:
     def run(self):
         if not self.app.tk_lock.acquire(blocking=False):
             return
-        self.app.set_main_window_enabled(False)
         try:
             dark = system_uses_dark_mode()
             bg = "#1F1F1F" if dark else "#FFFFFF"
@@ -2330,13 +2855,23 @@ class DesktopSsoWindow:
                 self.root = None
                 self.status_label = None
         finally:
-            self.app.set_main_window_enabled(True)
             self.app.tk_lock.release()
 
 class ClientApp:
     def __init__(self):
         self.config = load_config()
-        self.origin = str(self.config.get("server") or "")
+        self.policies = load_group_policy()
+        remove_redundant_user_startup_entry()
+        if "launch_at_startup" in self.policies:
+            set_startup_enabled(bool(self.policies["launch_at_startup"]))
+        configured_server = str(self.config.get("server") or "")
+        configured_input = str(self.config.get("server_input") or "").strip()
+        managed_input = str(self.policies.get("server_address") or "").strip()
+        if managed_input and configured_input != managed_input:
+            for key in ("token", "token_enc", "refresh_token", "refresh_token_enc", "role", "user_id", "kerberos_user_id"):
+                self.config.pop(key, None)
+            save_config(self.config)
+        self.origin = configured_server if not managed_input or configured_input == managed_input else ""
         self.token = read_secure_config_value(self.config, "token")
         self.refresh_token = read_secure_config_value(self.config, "refresh_token")
         self.role = str(self.config.get("role") or "")
@@ -2346,6 +2881,37 @@ class ClientApp:
         self.sso_provider = str(self.config.get("sso_provider") or "")
         self.desktop_sso_start_path = str(self.config.get("desktop_sso_start_path") or "/desktop/sso/start")
         self.desktop_sso_poll_path = str(self.config.get("desktop_sso_poll_path") or "/desktop/sso/poll")
+        self.kerberos_policy_mode = int(self.policies.get("kerberos_auto_login_policy", KERBEROS_POLICY_ALLOWED))
+        self.kerberos_enforced = self.kerberos_policy_mode == KERBEROS_POLICY_ENFORCED
+        self.kerberos_auto_login = bool(self.config.get("kerberos_auto_login")) and self.kerberos_policy_mode != KERBEROS_POLICY_DISABLED
+        self.kerberos_spn = str(self.config.get("kerberos_spn") or "")
+        self.kerberos_session_path = str(self.config.get("kerberos_session_path") or "/desktop/session/kerberos")
+        self.session_provider = str(self.config.get("session_provider") or "")
+        self.interactive_session_active = bool(
+            self.token
+            and str(self.role or "").strip().lower() != "guest"
+            and self.session_provider != "kerberos"
+        )
+        self.kerberos_user_id = self.config.get("kerberos_user_id")
+        if self.session_provider == "kerberos" and self.user_id is not None:
+            self.kerberos_user_id = self.user_id
+        try:
+            self.session_expires_at = int(self.config.get("session_expires_at") or desktop_token_expires_at(self.token) or 0)
+        except (TypeError, ValueError):
+            self.session_expires_at = desktop_token_expires_at(self.token)
+        policy_invalidated_session = bool(
+            self.kerberos_policy_mode == KERBEROS_POLICY_DISABLED
+            and self.session_provider == "kerberos"
+        )
+        if policy_invalidated_session:
+            self.token = ""
+            self.refresh_token = ""
+            self.role = ""
+            self.user_id = None
+            self.session_provider = ""
+            self.interactive_session_active = False
+            self.session_expires_at = 0
+            self.config["clear_webview_storage"] = True
         self.ws = None
         self.ws_thread = None
         self.tray = None
@@ -2369,16 +2935,38 @@ class ClientApp:
         self.tk_lock = threading.Lock()
         self.toasts = None
         self.receive_flash_until = 0.0
+        self.incoming_broadcasts = set()
+        self.incoming_broadcast_lock = threading.Lock()
         self.auth_notified = False
         self.cert_prompt_shown = False
         self.current_url = ""
         self.popup_close_confirming = threading.Event()
         self.tray_refresh_stop = threading.Event()
         self.tray_lock = threading.Lock()
+        self.tray_state = None
         self.sso_lock = threading.Lock()
         self.web_session_sync_lock = threading.Lock()
+        self.webview_eval_lock = threading.Lock()
+        self.webview_navigation_lock = threading.Lock()
+        self.webview_navigation_target = ""
+        self.main_window_visible = False
+        self.main_window_reveal_pending = False
+        self.main_window_reveal_lock = threading.Lock()
+        self.kerberos_lock = threading.Lock()
+        self.automatic_login_downgrade_lock = threading.Lock()
+        self.kerberos_stop = threading.Event()
+        self.auto_login_reveal_pending = False
+        self.auto_login_reveal_lock = threading.Lock()
+        self.explicit_reauth_active = False
         self.sso_active = False
         self.sso_prompt = None
+        self.kerberos_enforced_failure_active = False
+        self.automatic_login_downgrade_pending = False
+        # Older installs already displayed this notice before the setting was
+        # persisted. Do not show it again after an upgrade or session renewal.
+        if self.config.get("server") and "initial_connection_notice_shown" not in self.config:
+            self.config["initial_connection_notice_shown"] = True
+            save_config(self.config)
         INSECURE_HOSTS.update(str(host) for host in (self.config.get("insecure_hosts") or []))
         self.audio = AudioPlayer(on_state_change=self._on_audio_state_change)
         if self.config.get("clear_webview_storage"):
@@ -2399,23 +2987,6 @@ class ClientApp:
         except Exception:
             return 0
 
-    def set_main_window_enabled(self, enabled):
-        if os.name != "nt":
-            return False
-        hwnd = self.main_window_hwnd()
-        if not hwnd:
-            return False
-        try:
-            ctypes.windll.user32.EnableWindow(hwnd, bool(enabled))
-            if enabled:
-                try:
-                    ctypes.windll.user32.SetForegroundWindow(hwnd)
-                except Exception:
-                    pass
-            return True
-        except Exception:
-            return False
-
     def _window_invoke(self, callback, window=None):
         target = window or self.main_window
         if callback is None or target is None:
@@ -2429,12 +3000,12 @@ class ClientApp:
         except Exception:
             return None
 
-    def _window_eval_js(self, script, window=None, timeout=15):
-        # evaluate_js can block indefinitely (e.g. if the page navigates away
-        # mid-call), so run it on a worker thread and give up after a timeout
-        # instead of hanging the caller.
+    def _window_eval_js(self, script, window=None, timeout=5):
         target = window or self.main_window
         if target is None or getattr(target, "native", None) is None:
+            return None
+        eval_lock = getattr(self, "webview_eval_lock", None)
+        if eval_lock is not None and not eval_lock.acquire(blocking=False):
             return None
         result = {}
         done = threading.Event()
@@ -2445,20 +3016,49 @@ class ClientApp:
             except Exception:
                 result["value"] = None
             finally:
+                if eval_lock is not None:
+                    try:
+                        eval_lock.release()
+                    except RuntimeError:
+                        pass
                 done.set()
 
-        threading.Thread(target=run, daemon=True).start()
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except Exception:
+            if eval_lock is not None:
+                try:
+                    eval_lock.release()
+                except RuntimeError:
+                    pass
+            return None
         if not done.wait(timeout):
             return None
         return result.get("value")
 
     def _window_load_url(self, url, window=None):
-        self._window_invoke(lambda win: win.load_url(url), window=window)
+        target = window or self.main_window
+        requested_url = str(url or "")
+        if target is None or not requested_url:
+            return False
+        with self.main_window_reveal_lock:
+            if self.webview_navigation_target == requested_url:
+                return False
+            self.webview_navigation_target = requested_url
+
+        def navigate():
+            try:
+                with self.webview_navigation_lock:
+                    self._window_invoke(lambda win: win.load_url(requested_url), window=target)
+            finally:
+                with self.main_window_reveal_lock:
+                    if self.webview_navigation_target == requested_url:
+                        self.webview_navigation_target = ""
+
+        threading.Thread(target=navigate, daemon=True, name="WebViewNavigation").start()
+        return True
 
     def _window_get_current_url(self, window=None):
-        # window.get_current_url() waits (up to 20s) for pywebview's "loaded"
-        # event, which freezes callers - notably the UI thread during
-        # before_load. Read the renderer's cached URL directly instead.
         target = window or self.main_window
         if target is None:
             return ""
@@ -2476,9 +3076,13 @@ class ClientApp:
             win.show()
             win.restore()
         self._window_invoke(action, window=window)
+        if window is None or window is self.main_window:
+            self.main_window_visible = True
 
     def _window_hide(self, window=None):
         self._window_invoke(lambda win: win.hide(), window=window)
+        if window is None or window is self.main_window:
+            self.main_window_visible = False
 
     def _window_destroy(self, window=None):
         self._window_invoke(lambda win: win.destroy(), window=window)
@@ -2506,6 +3110,48 @@ class ClientApp:
                 time.sleep(0.25)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def suppress_native_webview_error_ui(self, window=None):
+        """Hide WebView2's built-in error surface when supported.
+
+        Certificate validation remains enabled; only the embedded browser's
+        generic UI is suppressed so the client can show its own error page.
+        """
+        window = window or self.main_window
+        native = getattr(window, "native", None) if window is not None else None
+        if native is None:
+            return
+        candidates = [native]
+        for name in ("CoreWebView2", "core_webview", "webview", "WebView", "Browser"):
+            try:
+                value = getattr(native, name)
+            except Exception:
+                value = None
+            if value is not None:
+                candidates.append(value)
+        for candidate in list(candidates):
+            try:
+                core = getattr(candidate, "CoreWebView2")
+                if core is not None:
+                    candidates.append(core)
+            except Exception:
+                pass
+        for candidate in candidates:
+            try:
+                settings = getattr(candidate, "Settings")
+            except Exception:
+                settings = None
+            if settings is None:
+                continue
+            for name, value in (
+                ("IsBuiltInErrorPageEnabled", False),
+                ("AreDevToolsEnabled", False),
+                ("IsStatusBarEnabled", False),
+            ):
+                try:
+                    setattr(settings, name, value)
+                except Exception:
+                    pass
 
     def _on_audio_state_change(self, playing):
         window = self.main_window
@@ -2667,6 +3313,9 @@ class ClientApp:
                 return True
 
             def confirm_logout(self):
+                if app.kerberos_enforced:
+                    threading.Thread(target=app.downgrade_to_automatic_login, daemon=True).start()
+                    return False
                 answer = native_message_box(
                     app.product_name,
                     "Are you sure you want to log out? You may not be able to receive messages until you log in again.",
@@ -2674,10 +3323,6 @@ class ClientApp:
                     owner=app.main_window_hwnd(),
                 )
                 if answer == IDYES:
-                    # Run the logout (which navigates the webview) after this
-                    # JS-API call returns. Navigating synchronously here would
-                    # destroy pywebview's pending return-value callback for this
-                    # call and raise a JavascriptException on the resolver thread.
                     threading.Thread(target=lambda: app.logout(rebuild_guest=True), daemon=True).start()
                 return False
 
@@ -2720,7 +3365,7 @@ class ClientApp:
         self.config["product_name"] = cleaned
         save_config(self.config)
         if self.tray is not None:
-            self.tray.title = self.tray_tooltip()
+            self.refresh_tray()
         if self.main_window is not None:
             try:
                 self._window_set_title(cleaned)
@@ -2730,10 +3375,16 @@ class ClientApp:
             self.toasts.refresh_name()
 
     def tray_tooltip(self):
+        with self.incoming_broadcast_lock:
+            receiving = bool(self.incoming_broadcasts)
+        if receiving:
+            return f"{self.product_name} - Incoming Broadcast"
         return f"{self.product_name} - " + ("Connected" if self.connected else "Disconnected")
 
     def tray_icon_image(self):
-        if time.time() < self.receive_flash_until:
+        with self.incoming_broadcast_lock:
+            receiving = bool(self.incoming_broadcasts)
+        if receiving:
             return tinted_favicon(COLOR_RECEIVING)
         if not self.origin or not self.token:
             return tinted_favicon(COLOR_IDLE)
@@ -2743,17 +3394,24 @@ class ClientApp:
         tray = self.tray
         if tray is None:
             return
+        with self.incoming_broadcast_lock:
+            receiving = bool(self.incoming_broadcasts)
+        state = (
+            self.product_name,
+            bool(self.origin and self.token),
+            bool(self.connected),
+            receiving,
+        )
         with self.tray_lock:
+            if state == self.tray_state:
+                return
+            self.tray_state = state
             try:
                 tray.icon = self.tray_icon_image().copy()
             except Exception:
                 pass
             try:
                 tray.title = self.tray_tooltip()
-            except Exception:
-                pass
-            try:
-                tray.update_menu()
             except Exception:
                 pass
 
@@ -2774,6 +3432,30 @@ class ClientApp:
 
         threading.Thread(target=restore, daemon=True).start()
 
+    def begin_incoming_broadcast(self, broadcast_id, live_audio=False):
+        key = str(broadcast_id or "").strip() or secrets.token_hex(8)
+        with self.incoming_broadcast_lock:
+            self.incoming_broadcasts.add(key)
+        self.refresh_tray()
+        if live_audio:
+            return key
+
+        def finish_non_streaming():
+            time.sleep(4)
+            self.end_incoming_broadcast(key)
+
+        threading.Thread(target=finish_non_streaming, daemon=True).start()
+        return key
+
+    def end_incoming_broadcast(self, broadcast_id):
+        key = str(broadcast_id or "").strip()
+        with self.incoming_broadcast_lock:
+            if key:
+                self.incoming_broadcasts.discard(key)
+            else:
+                self.incoming_broadcasts.clear()
+        self.refresh_tray()
+
     def start_tray(self):
         menu = pystray.Menu(
             pystray.MenuItem("Open", lambda: threading.Thread(target=self.show_main_window, daemon=True).start(), default=True),
@@ -2781,9 +3463,9 @@ class ClientApp:
             pystray.MenuItem("App Settings", lambda: threading.Thread(target=self.open_app_settings, daemon=True).start()),
         )
         self.tray_refresh_stop.clear()
+        self.tray_state = None
         self.tray = pystray.Icon("OpenPagingServerClient", self.tray_icon_image().copy(), self.tray_tooltip(), menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
-        threading.Thread(target=self.tray_refresh_loop, daemon=True).start()
         self.toasts = ToastCenter(self)
 
     def set_status(self, connected):
@@ -2800,6 +3482,7 @@ class ClientApp:
                     "You will now be able to receive pages and emergency notifications.",
                 )
         else:
+            self.end_incoming_broadcast("")
             if self.disconnect_since is None:
                 self.disconnect_since = time.time()
             if not self.offline_notified and (time.time() - self.disconnect_since) >= 30:
@@ -2810,21 +3493,16 @@ class ClientApp:
                     "We'll retry the connection in the background.",
                 )
         self.refresh_tray()
-
-        def delayed_refresh():
-            time.sleep(0.35)
-            self.refresh_tray()
-            time.sleep(1.25)
-            self.refresh_tray()
-
-        threading.Thread(target=delayed_refresh, daemon=True).start()
         if connected and not was_connected:
             self.maybe_show_welcome_toast()
 
     def maybe_show_welcome_toast(self):
-        if not self.pending_welcome:
+        if not self.pending_welcome or self.config.get("initial_connection_notice_shown"):
+            self.pending_welcome = False
             return
         self.pending_welcome = False
+        self.config["initial_connection_notice_shown"] = True
+        save_config(self.config)
         self.notify(
             f"Connected to {self.product_name}",
             "You are now ready to receive pages and emergency notifications from your organization.",
@@ -2844,9 +3522,14 @@ class ClientApp:
             return raw
         if not raw.startswith("/"):
             raw = "/" + raw
-        if "desktop_client=" in raw:
+        parameters = []
+        if "desktop_client=" not in raw:
+            parameters.append("desktop_client=1")
+        if self.kerberos_enforced and "enforced_auto_login=" not in raw:
+            parameters.append("enforced_auto_login=1")
+        if not parameters:
             return raw
-        return raw + ("&" if "?" in raw else "?") + "desktop_client=1"
+        return raw + ("&" if "?" in raw else "?") + "&".join(parameters)
 
     def _url_origin_parts(self, value):
         parsed = urllib.parse.urlparse(str(value or ""))
@@ -2885,6 +3568,41 @@ class ClientApp:
         prefixes = ("/login/sso", "/login/oidc", "/login/saml", "/desktop/sso", "/auth/sso")
         return path.startswith(prefixes) or "/sso/" in path or path.endswith("/sso")
 
+    def is_explicit_reauth_url(self, url):
+        try:
+            parsed = urllib.parse.urlparse(str(url or ""))
+            path = str(parsed.path or "").rstrip("/").lower()
+            query = urllib.parse.parse_qs(parsed.query)
+        except Exception:
+            return False
+        return path == "/login" and any(
+            str(value).strip().lower() in {"1", "true", "yes", "on"}
+            for value in query.get("reauth", [])
+        )
+
+    def begin_explicit_reauth(self, window=None):
+        if self.explicit_reauth_active:
+            return
+        self.explicit_reauth_active = True
+        target = window or self.main_window
+        if target is not None:
+            threading.Thread(
+                target=self._window_eval_js,
+                args=("window._opsTokenValue=null;window._opsTokenValueAt=0;window._opsTokenBusy=false;",),
+                kwargs={"window": target},
+                daemon=True,
+                name="WebViewReauthReset",
+            ).start()
+
+    def is_visible_receiver_login(self, url):
+        if self.session_provider != "kerberos" or not self.main_window_visible:
+            return False
+        try:
+            path = str(urllib.parse.urlparse(str(url or "")).path or "").rstrip("/").lower()
+        except Exception:
+            return False
+        return path == "/login" or path.startswith("/login/")
+
     def open_in_default_browser(self, url):
         raw = str(url or "").strip()
         if not raw:
@@ -2918,11 +3636,6 @@ class ClientApp:
             pass
 
     def _deferred_return_to_safe_main_url(self, delay=0.05):
-        # Navigating the webview synchronously from inside a pywebview JS-API
-        # method (e.g. open_external_url) destroys the pending return-value
-        # callback for that call and raises a JavascriptException
-        # ("_returnValuesCallbacks.<method> is not a function"). Deferring the
-        # navigation to a worker thread lets the JS-API call resolve first.
         def run():
             if delay:
                 time.sleep(delay)
@@ -2934,6 +3647,10 @@ class ClientApp:
         if not raw:
             return False
         if self.is_server_url(raw) and self.is_sso_url(raw):
+            if self.kerberos_enforced:
+                self.notify(self.product_name, "Single sign-on is disabled because Automatic Login is enforced by your administrator.")
+                self._deferred_return_to_safe_main_url()
+                return True
             self.start_desktop_sso_flow()
             self._deferred_return_to_safe_main_url()
             return True
@@ -3026,7 +3743,6 @@ class ClientApp:
                 continue
             token = str((session or {}).get("token") or "")
             if token:
-                self.pending_welcome = True
                 self.apply_session(session)
                 self.start_reconnect_loop()
                 if prompt is not None:
@@ -3047,19 +3763,43 @@ class ClientApp:
         window = self.main_window
         if window is None:
             return
-        try:
-            self._window_show_restore(window=window)
-        except Exception:
-            pass
         if not self.origin:
+            self._window_show_restore(window=window)
             return
         page = self._desktop_page_path(path)
         target = page if page.startswith("http://") or page.startswith("https://") else self.origin.rstrip("/") + page
         if not self.is_allowed_webview_url(target):
             self.open_in_default_browser(target)
             target = self.safe_main_url()
-        if path or not self.is_server_url(self.current_url) or self.error_page_active:
+        needs_navigation = bool(path or not self.is_server_url(self.current_url) or self.error_page_active)
+        if needs_navigation and not self.main_window_visible:
+            with self.main_window_reveal_lock:
+                self.main_window_reveal_pending = True
+        if needs_navigation:
             self.load_server_url(target, window=window)
+        else:
+            self._window_show_restore(window=window)
+
+    def prepare_auto_login_dashboard(self):
+        """Bind the receiver-only web session while the WebView remains hidden."""
+        window = self.main_window
+        if window is None or not self.origin:
+            return
+        self.kerberos_enforced_failure_active = False
+        with self.auto_login_reveal_lock:
+            self.auto_login_reveal_pending = not self.start_minimized
+        target = self.origin.rstrip("/") + self._desktop_page_path("/login")
+        self.load_server_url(target, window=window)
+
+        def reveal_fallback():
+            time.sleep(15)
+            with self.auto_login_reveal_lock:
+                if not self.auto_login_reveal_pending:
+                    return
+                self.auto_login_reveal_pending = False
+            self._window_show_restore(window=window)
+
+        threading.Thread(target=reveal_fallback, daemon=True).start()
 
     def _has_internet(self):
         for host in (("1.1.1.1", 53), ("8.8.8.8", 53), ("208.67.222.222", 53)):
@@ -3083,29 +3823,49 @@ class ClientApp:
             with urllib.request.urlopen(request, timeout=timeout, context=request_ssl_context(url)):
                 return ""
         except urllib.error.HTTPError:
-            # The server responded (even with an error status): it is reachable.
             return ""
         except (socket.timeout, TimeoutError):
             return "timeout"
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", None)
+            connection_log(f"Preflight failed for {origin}: {type(reason).__name__}: {reason}")
             if isinstance(reason, ConnectionRefusedError):
                 return "refused"
             if isinstance(reason, (socket.timeout, TimeoutError)):
                 return "timeout"
             if isinstance(reason, ssl.SSLError):
-                return "unable"
+                # WebView2 uses Windows/Schannel trust. A Python/OpenSSL TLS
+                # disagreement must not block a certificate Windows trusts.
+                return "" if self._origin_port_reachable(timeout=timeout) else "unable"
             if not self._has_internet():
                 return "no_internet"
             if isinstance(reason, ConnectionResetError):
                 return "refused"
+            if urllib.parse.urlparse(origin).scheme == "https" and self._origin_port_reachable(timeout=timeout):
+                return ""
             return "unable"
         except ConnectionRefusedError:
             return "refused"
-        except Exception:
+        except Exception as exc:
+            connection_log(f"Preflight failed for {origin}: {type(exc).__name__}: {exc}")
+            if urllib.parse.urlparse(origin).scheme == "https" and self._origin_port_reachable(timeout=timeout):
+                return ""
             if not self._has_internet():
                 return "no_internet"
             return "unable"
+
+    def _origin_port_reachable(self, timeout=6):
+        try:
+            parsed = urllib.parse.urlparse(str(self.origin or ""))
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if not host:
+                return False
+            connection = socket.create_connection((host, port), timeout=timeout)
+            connection.close()
+            return True
+        except Exception:
+            return False
 
     def _webview_error_html(self, error_type):
         catalog = {
@@ -3201,6 +3961,44 @@ class ClientApp:
   </script>
 </body></html>"""
 
+    def _kerberos_enforced_failure_html(self):
+        dark = system_uses_dark_mode()
+        bg = "#1B1B1B" if dark else "#F5F6F8"
+        card_bg = "#262626" if dark else "#FFFFFF"
+        fg = "#F1F1F1" if dark else "#1A1A1A"
+        subtle = "#B0B0B0" if dark else "#5F6368"
+        border = "#3A3A3A" if dark else "#E0E0E0"
+        return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{{height:100%;margin:0}} body{{background:{bg};color:{fg};font-family:"Segoe UI",sans-serif;display:flex;align-items:center;justify-content:center}}
+.card{{background:{card_bg};border:1px solid {border};border-radius:14px;padding:42px;max-width:520px;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.18)}}
+.icon{{color:#E53935;font-size:54px;line-height:1;margin-bottom:14px}} h1{{font-size:24px;margin:0 0 14px}} p{{color:{subtle};font-size:15px;line-height:1.55;margin:0}} .retry{{font-size:12px;margin-top:22px}}
+</style></head><body><div class="card"><div class="icon">&#9888;</div><h1>Unable to login</h1>
+<p>You will not be able to receive pages and emergency messages. Please contact your system administrator for help.</p>
+<p class="retry">Trying Automatic Login again in the background&hellip;</p></div></body></html>"""
+
+    def show_kerberos_enforced_failure(self):
+        if not self.kerberos_enforced or self.main_window is None:
+            return
+        if self.kerberos_enforced_failure_active:
+            return
+        self.kerberos_enforced_failure_active = True
+        self.token = ""
+        self.refresh_token = ""
+        self.role = ""
+        self.user_id = None
+        self.session_provider = ""
+        self.session_expires_at = 0
+        self.persist_session_state()
+        try:
+            html = self._kerberos_enforced_failure_html()
+            self._window_invoke(lambda win: win.load_html(html), window=self.main_window)
+            self.current_url = ""
+            self._window_show_restore(window=self.main_window)
+        except Exception:
+            pass
+
     def _clear_error_page(self):
         with self.error_lock:
             self.error_page_active = False
@@ -3210,7 +4008,6 @@ class ClientApp:
         window = window or self.main_window
         if window is None:
             return
-        # Fast path: a healthy realtime connection means the server is reachable.
         if self.connected:
             self._clear_error_page()
             try:
@@ -3246,6 +4043,11 @@ class ClientApp:
             self.current_url = ""
         except Exception:
             pass
+        with self.main_window_reveal_lock:
+            reveal_main = self.main_window_reveal_pending
+            self.main_window_reveal_pending = False
+        if reveal_main:
+            self._window_show_restore(window=window)
 
         def retry_loop():
             while not stop.is_set() and not self.reconnect_stop.is_set():
@@ -3282,6 +4084,8 @@ class ClientApp:
 
     def hide_main_window(self):
         self._clear_error_page()
+        with self.main_window_reveal_lock:
+            self.main_window_reveal_pending = False
         if self.main_window is not None:
             try:
                 self._window_hide(window=self.main_window)
@@ -3296,6 +4100,7 @@ class ClientApp:
     def quit(self):
         self.reconnect_stop.set()
         self.tray_refresh_stop.set()
+        self.kerberos_stop.set()
         if self.ws is not None:
             try:
                 self.ws.close()
@@ -3318,6 +4123,8 @@ class ClientApp:
         os._exit(0)
 
     def disconnect_from_server(self):
+        if "server_address" in self.policies:
+            return
         self.notify_server_logout()
         self.reconnect_stop.set()
         if self.ws is not None:
@@ -3329,9 +4136,12 @@ class ClientApp:
         self.refresh_token = ""
         self.role = ""
         self.user_id = None
+        self.kerberos_user_id = None
+        self.session_provider = ""
+        self.session_expires_at = 0
         self.origin = ""
         self.guest_available = False
-        for key in ("server", "server_input", "token", "token_enc", "refresh_token", "refresh_token_enc", "role", "user_id", "product_name", "guest_available", "sso_provider", "desktop_sso_start_path", "desktop_sso_poll_path"):
+        for key in ("server", "server_input", "token", "token_enc", "refresh_token", "refresh_token_enc", "role", "user_id", "kerberos_user_id", "product_name", "guest_available", "sso_provider", "desktop_sso_start_path", "desktop_sso_poll_path", "kerberos_auto_login", "kerberos_spn", "kerberos_session_path", "session_provider", "session_expires_at"):
             self.config.pop(key, None)
         save_config(self.config)
         self.product_name = APP_FALLBACK_NAME
@@ -3360,21 +4170,11 @@ class ClientApp:
 
     def apply_server(self, raw_input_value, info, origin):
         self.origin = origin
-        self.guest_available = bool(info.get("guest_receiver_enabled"))
-        self.sso_provider = str(info.get("sso_provider") or "")
-        self.desktop_sso_start_path = str(info.get("desktop_sso_start_path") or "/desktop/sso/start")
-        self.desktop_sso_poll_path = str(info.get("desktop_sso_poll_path") or "/desktop/sso/poll")
+        self.apply_server_capabilities(info)
         self.set_product_name(info.get("product_name"))
-        self.config.update({
-            "server": origin,
-            "server_input": raw_input_value,
-            "guest_available": self.guest_available,
-            "sso_provider": self.sso_provider,
-            "desktop_sso_start_path": self.desktop_sso_start_path,
-            "desktop_sso_poll_path": self.desktop_sso_poll_path,
-        })
+        self.config.update({"server": origin, "server_input": raw_input_value})
         save_config(self.config)
-        self.pending_welcome = True
+        self.pending_welcome = not bool(self.config.get("initial_connection_notice_shown"))
         if self.guest_available and not self.token:
             try:
                 session, _url = http_json(origin, "/desktop/session/guest", method="POST", timeout=3)
@@ -3382,25 +4182,115 @@ class ClientApp:
             except Exception:
                 pass
         self.start_reconnect_loop()
-        self.show_main_window("/")
+
+        def finish_initial_login():
+            kerberos_ready = self.try_kerberos_auto_login()
+            if kerberos_ready and self.has_valid_enforced_session():
+                self.prepare_auto_login_dashboard()
+            elif self.kerberos_enforced:
+                self.show_kerberos_enforced_failure()
+            elif not self.launched_at_startup:
+                self.show_main_window("/")
+
+        threading.Thread(target=finish_initial_login, daemon=True).start()
+
+    def apply_server_capabilities(self, info):
+        self.guest_available = bool(info.get("guest_receiver_enabled"))
+        self.sso_provider = str(info.get("sso_provider") or "")
+        self.desktop_sso_start_path = str(info.get("desktop_sso_start_path") or "/desktop/sso/start")
+        self.desktop_sso_poll_path = str(info.get("desktop_sso_poll_path") or "/desktop/sso/poll")
+        server_kerberos_enabled = bool(info.get("kerberos_auto_login"))
+        self.kerberos_auto_login = bool(
+            server_kerberos_enabled and self.kerberos_policy_mode != KERBEROS_POLICY_DISABLED
+        )
+        self.kerberos_spn = str(info.get("kerberos_spn") or "").strip()
+        self.kerberos_session_path = str(info.get("kerberos_session_path") or "/desktop/session/kerberos")
+        self.config.update({
+            "guest_available": self.guest_available,
+            "sso_provider": self.sso_provider,
+            "desktop_sso_start_path": self.desktop_sso_start_path,
+            "desktop_sso_poll_path": self.desktop_sso_poll_path,
+            "kerberos_auto_login": server_kerberos_enabled,
+            "kerberos_spn": self.kerberos_spn,
+            "kerberos_session_path": self.kerberos_session_path,
+        })
+        save_config(self.config)
+
+    def refresh_server_capabilities(self):
+        source = str(self.config.get("server_input") or self.origin or "").strip()
+        if not source:
+            return False
+        try:
+            info, origin = probe_server(source)
+        except Exception:
+            return False
+        self.origin = origin
+        self.apply_server_capabilities(info)
+        self.set_product_name(info.get("product_name"))
+        return True
 
     def apply_session(self, session):
-        old_identity = desktop_token_identity(self.token)
+        old_token = str(self.token or "")
         new_token = str((session or {}).get("token") or "")
         new_identity = desktop_token_identity(new_token)
-        same_live_identity = bool(old_identity[0] and new_identity[0] and old_identity == new_identity)
-        self.token = new_token
-        self.refresh_token = str((session or {}).get("refresh_token") or self.refresh_token or "")
+        provider = str((session or {}).get("auto_login_provider") or "").strip().lower()
+        if (
+            provider == "kerberos"
+            and self.interactive_session_active
+            and not self.automatic_login_downgrade_pending
+        ):
+            # Older servers identify every Kerberos-backed web session as
+            # receiver-only. An explicit in-client upgrade is interactive even
+            # when the account's authentication provider is Kerberos.
+            provider = ""
         user = (session or {}).get("user") or {}
+        incoming_user_id = user.get("id")
+        if incoming_user_id is None and new_identity[0]:
+            incoming_user_id = new_identity[0]
+        if (
+            self.kerberos_enforced
+            and provider != "kerberos"
+            and self.automatic_login_downgrade_pending
+        ):
+            kerberos_log(
+                "Rejected an interactive session while an enforced logout downgrade was pending"
+            )
+            if not self.automatic_login_downgrade_pending or self.session_provider == "kerberos":
+                threading.Thread(target=self.restore_enforced_web_session, daemon=True).start()
+            return False
+        self.token = new_token
+        if provider:
+            self.refresh_token = ""
+            self.session_provider = provider
+            self.interactive_session_active = False
+        elif "refresh_token" in (session or {}):
+            self.refresh_token = str((session or {}).get("refresh_token") or "")
+            self.session_provider = ""
+            self.interactive_session_active = True
+        elif self.interactive_session_active:
+            self.session_provider = ""
         self.role = str(user.get("role") or "")
-        self.user_id = user.get("id")
+        self.user_id = incoming_user_id
+        if provider == "kerberos" and self.user_id is not None:
+            self.kerberos_user_id = self.user_id
+        try:
+            self.session_expires_at = int((session or {}).get("expires_at") or desktop_token_expires_at(new_token) or 0)
+        except (TypeError, ValueError):
+            self.session_expires_at = desktop_token_expires_at(new_token)
         self.persist_session_state()
-        if self.ws is not None and not same_live_identity:
+        # A socket authenticates once, during its handshake. Even when a token
+        # refresh or interactive upgrade keeps the same user identity, the
+        # existing receiver is still bound to the old credential and must be
+        # replaced so it follows the session the WebView is using now.
+        if self.ws is not None and old_token != new_token:
             self.ws.close()
             self.ws = None
         self.refresh_tray()
+        if self.kerberos_enforced:
+            self.apply_enforced_web_policy()
         if str(self.role or "").strip().lower() != "guest":
             self.sync_web_session_in_webview()
+        return True
 
     def sync_web_session_in_webview(self):
         if not self.web_session_sync_lock.acquire(blocking=False):
@@ -3420,11 +4310,23 @@ class ClientApp:
                     return
                 if current and not self.is_server_url(current):
                     return
+                if self.is_explicit_reauth_url(current):
+                    self.begin_explicit_reauth(window)
+                    return
+                if self.explicit_reauth_active:
+                    return
                 current_path = ""
                 try:
                     current_path = str(urllib.parse.urlparse(current).path or "").rstrip("/")
                 except Exception:
                     current_path = ""
+                if self.is_visible_receiver_login(current):
+                    # A visible receiver-only session reaching the login page
+                    # is an interactive upgrade, even if an older server/link
+                    # omitted ?reauth=1. Do not immediately post the old
+                    # Automatic Login token and bounce the user back.
+                    self.begin_explicit_reauth(window)
+                    return
                 if current_path == "/login" or current_path.startswith("/login/"):
                     try:
                         self.refresh_desktop_session(timeout=4)
@@ -3439,14 +4341,15 @@ class ClientApp:
                     "if(!t)return false;"
                     "try{"
                     "fetch('/desktop/session/web-login?desktop_client=1',{method:'POST',credentials:'include',headers:{'"
-                    + DESKTOP_CLIENT_HEADER + "':'1','Authorization':'Bearer '+t}})"
+                    + DESKTOP_CLIENT_HEADER + "':'1','" + ENFORCED_AUTO_LOGIN_HEADER + "':'"
+                    + ("1" if self.kerberos_enforced else "0") + "','Authorization':'Bearer '+t}})"
                     ".then(function(r){return !!(r&&r.ok);})"
                     ".then(function(ok){"
                     "if(!ok)return;"
                     "try{"
                     "var path=(window.location&&window.location.pathname?window.location.pathname:'');"
                     "if(path.indexOf('/login')!==-1){"
-                    "window.location.href='/?desktop_client=1';"
+                    "window.location.href='/dashboard?desktop_client=1';"
                     "}"
                     "}catch(_e){}"
                     "})"
@@ -3464,11 +4367,198 @@ class ClientApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def restore_enforced_web_session(self):
+        """Restore the policy-bound identity after a browser logout or account switch."""
+        if not self.kerberos_enforced or not self.origin:
+            return False
+        if not self.token or not self.has_valid_enforced_session():
+            if not self.try_kerberos_auto_login(force=True):
+                self.show_kerberos_enforced_failure()
+                return False
+        window = self.main_window
+        if window is None:
+            return False
+        token = json.dumps(str(self.token or ""))
+        script = (
+            "(async function(){"
+            "try{var r=await fetch('/desktop/session/web-login?desktop_client=1',{method:'POST',credentials:'include',headers:{'"
+            + DESKTOP_CLIENT_HEADER
+            + "':'1','"
+            + ENFORCED_AUTO_LOGIN_HEADER
+            + "':'1','Authorization':'Bearer '+"
+            + token
+            + "}});"
+            "if(!r||!r.ok)return false;"
+            "window._opsTokenValue=null;window._opsTokenValueAt=0;window._opsTokenBusy=false;"
+            "window.location.replace('/dashboard?desktop_client=1');return true;"
+            "}catch(_e){return false;}})()"
+        )
+        try:
+            self._window_eval_js(script, window=window)
+            self.current_url = self.origin.rstrip("/") + "/dashboard?desktop_client=1"
+            return True
+        except Exception:
+            self.prepare_auto_login_dashboard()
+            return False
+
+    def downgrade_to_automatic_login(self):
+        """Replace a full session with the enforced receiver-only Automatic Login session."""
+        if not self.kerberos_enforced:
+            return False
+        if not self.automatic_login_downgrade_lock.acquire(blocking=False):
+            return False
+        try:
+            old_token = str(self.token or "")
+            if not old_token:
+                return False
+            self.automatic_login_downgrade_pending = True
+            try:
+                session, _url = http_json(
+                    self.origin,
+                    "/desktop/session/enforced-downgrade",
+                    method="POST",
+                    token=old_token,
+                    timeout=10,
+                    extra_headers={ENFORCED_AUTO_LOGIN_HEADER: "1"},
+                )
+            except Exception:
+                self.automatic_login_downgrade_pending = False
+                return False
+            if not self.apply_session(session) or self.session_provider != "kerberos":
+                self.automatic_login_downgrade_pending = False
+                return False
+            self.explicit_reauth_active = False
+            restored = self.restore_enforced_web_session()
+
+            def clear_pending_fallback():
+                time.sleep(10)
+                if self.session_provider == "kerberos":
+                    self.automatic_login_downgrade_pending = False
+                    self.apply_enforced_web_policy()
+
+            threading.Thread(target=clear_pending_fallback, daemon=True).start()
+            return restored
+        finally:
+            self.automatic_login_downgrade_lock.release()
+
     def persist_session_state(self):
-        self.config.update({"role": self.role, "user_id": self.user_id})
+        self.config.update({
+            "role": self.role,
+            "user_id": self.user_id,
+            "session_provider": self.session_provider,
+            "session_expires_at": self.session_expires_at,
+            "kerberos_user_id": self.kerberos_user_id,
+        })
         write_secure_config_value(self.config, "token", self.token)
         write_secure_config_value(self.config, "refresh_token", self.refresh_token)
         save_config(self.config)
+
+    def has_valid_enforced_session(self):
+        expires_at = self.session_expires_at or desktop_token_expires_at(self.token)
+        return bool(
+            self.token
+            and str(self.role or "").lower() != "guest"
+            and expires_at > int(time.time()) + 30
+            and (
+                self.session_provider != "kerberos"
+                or (
+                    self.kerberos_user_id is not None
+                    and str(self.user_id) == str(self.kerberos_user_id)
+                )
+            )
+        )
+
+    def try_kerberos_auto_login(self, force=False):
+        if not self.origin or not self.kerberos_auto_login or not self.kerberos_spn:
+            return False
+        if self.explicit_reauth_active and not self.automatic_login_downgrade_pending:
+            # Do not let maintenance replace a session while the user is
+            # upgrading the receiver-only identity in the embedded browser.
+            return bool(self.token)
+        if not self.kerberos_lock.acquire(blocking=False):
+            return False
+        try:
+            now = int(time.time())
+            if self.token and str(self.role or "").lower() != "guest":
+                expires_at = self.session_expires_at or desktop_token_expires_at(self.token)
+                if expires_at > now + 30:
+                    if self.session_provider != "kerberos":
+                        # A valid interactive session is authoritative. Enforced
+                        # Automatic Login supplies the fallback receiver; it
+                        # must never replace a session the user explicitly
+                        # authenticated, even when it belongs to another OPS
+                        # account.
+                        if force and self.kerberos_enforced and self.automatic_login_downgrade_pending:
+                            pass
+                        else:
+                            return True
+                    if not force and expires_at > now + 86400:
+                        return True
+                else:
+                    kerberos_log("Saved desktop session expired; falling back to Automatic Login")
+                    self.token = ""
+                    self.refresh_token = ""
+                    self.role = ""
+                    self.user_id = None
+                    self.session_provider = ""
+                    self.session_expires_at = 0
+                    self.persist_session_state()
+            kerberos_log(f"Starting Automatic Login for service principal {self.kerberos_spn}")
+            auth, token = acquire_windows_kerberos_token(self.kerberos_spn)
+            kerberos_log("Windows issued an Automatic Login service token")
+            session, _url = http_json(
+                self.origin,
+                self.kerberos_session_path,
+                method="POST",
+                body={"token": token},
+                timeout=15,
+                extra_headers={ENFORCED_AUTO_LOGIN_HEADER: "1"} if self.kerberos_enforced else None,
+            )
+            finish_windows_kerberos_exchange(auth, (session or {}).get("negotiate_token"))
+            if not str((session or {}).get("token") or ""):
+                kerberos_log("Server response did not contain a desktop session token")
+                return False
+            if (
+                self.kerberos_enforced
+                and not self.automatic_login_downgrade_pending
+                and self.session_provider != "kerberos"
+                and self.has_valid_enforced_session()
+            ):
+                kerberos_log("Kept the newer interactive session instead of replacing it with Automatic Login")
+                return True
+            self.apply_session(session)
+            self.kerberos_enforced_failure_active = False
+            kerberos_log(f"Automatic Login succeeded for OPS user ID {self.user_id}")
+            self.auth_notified = False
+            self.start_reconnect_loop()
+            return True
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(2048).decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            kerberos_log(f"Server rejected Automatic Login: HTTP {exc.code} {detail}")
+            return False
+        except Exception as exc:
+            kerberos_log(f"Automatic Login failed in {type(exc).__name__}: {exc}")
+            return False
+        finally:
+            self.kerberos_lock.release()
+
+    def kerberos_maintenance_loop(self):
+        next_regular_refresh = time.time() + 3600
+        while not self.kerberos_stop.wait(30):
+            if self.kerberos_enforced:
+                if self.has_valid_enforced_session():
+                    continue
+                if self.try_kerberos_auto_login(force=True):
+                    self.prepare_auto_login_dashboard()
+                else:
+                    self.show_kerberos_enforced_failure()
+                continue
+            if time.time() >= next_regular_refresh:
+                self.try_kerberos_auto_login()
+                next_regular_refresh = time.time() + 3600
 
     def refresh_desktop_session(self, timeout=10):
         if not self.origin or not self.refresh_token:
@@ -3480,6 +4570,7 @@ class ClientApp:
                 method="POST",
                 body={"refresh_token": self.refresh_token},
                 timeout=timeout,
+                extra_headers={ENFORCED_AUTO_LOGIN_HEADER: "1"} if self.kerberos_enforced else None,
             )
         except urllib.error.HTTPError as exc:
             if exc.code in (400, 401, 403, 404):
@@ -3487,6 +4578,8 @@ class ClientApp:
                 self.refresh_token = ""
                 self.role = ""
                 self.user_id = None
+                self.session_provider = ""
+                self.session_expires_at = 0
                 self.persist_session_state()
             return False
         except Exception:
@@ -3612,6 +4705,9 @@ class ClientApp:
         self.delete_webview_storage()
 
     def logout(self, rebuild_guest=True):
+        if self.kerberos_enforced:
+            threading.Thread(target=self.downgrade_to_automatic_login, daemon=True).start()
+            return
         self.notify_server_logout()
         self.reconnect_stop.set()
         if self.ws is not None:
@@ -3626,12 +4722,17 @@ class ClientApp:
         self.refresh_token = ""
         self.role = ""
         self.user_id = None
+        self.session_provider = ""
+        self.session_expires_at = 0
         self.persist_session_state()
         self.connected = False
         self.auth_notified = False
         self.reconnect_stop = threading.Event()
         self.ws_thread = None
         self.refresh_tray()
+        if rebuild_guest and self.try_kerberos_auto_login(force=True):
+            self.show_main_window("/")
+            return
         if rebuild_guest and self.guest_available and self.origin:
             try:
                 session, _url = http_json(self.origin, "/desktop/session/guest", method="POST")
@@ -3686,8 +4787,10 @@ class ClientApp:
                 delay = min(delay * 2, 30)
                 continue
             except PermissionError:
+                if client.token != str(self.token or ""):
+                    continue
                 self.set_status(False)
-                self.handle_auth_failure()
+                self.handle_auth_failure(failed_token=client.token)
                 time.sleep(5)
                 continue
             except Exception:
@@ -3698,19 +4801,42 @@ class ClientApp:
                 continue
             delay = 2
             self.startup_check_done = True
+            if client.token != str(self.token or ""):
+                # The session changed while this socket was handshaking. Never
+                # publish or run a receiver that is already stale.
+                client.close()
+                continue
             self.ws = client
             self.set_status(True)
             client.run()
             self.ws = None
             if not stop.is_set():
+                if client.token != str(self.token or ""):
+                    continue
                 self.set_status(False)
             time.sleep(2)
 
-    def handle_auth_failure(self):
+    def handle_auth_failure(self, failed_token=""):
+        failed_token = str(failed_token or "")
+        if failed_token and failed_token != str(self.token or ""):
+            # This failure belongs to a socket created before a login upgrade
+            # or token refresh. Never clear the newer session because of it.
+            return
+        if self.explicit_reauth_active and not self.kerberos_enforced:
+            return
+        if self.explicit_reauth_active:
+            return
         if self.refresh_desktop_session():
             return
         self.token = ""
         self.persist_session_state()
+        if self.try_kerberos_auto_login(force=True):
+            if self.kerberos_enforced:
+                threading.Thread(target=self.restore_enforced_web_session, daemon=True).start()
+            return
+        if self.kerberos_enforced:
+            self.show_kerberos_enforced_failure()
+            return
         if self.guest_available and self.role == "guest":
             try:
                 session, _url = http_json(self.origin, "/desktop/session/guest", method="POST")
@@ -3730,6 +4856,7 @@ class ClientApp:
             "if(window._opsTokenValue&&window._opsTokenValueAt&&now-window._opsTokenValueAt<60000)return window._opsTokenValue;"
             "window._opsTokenBusy=true;"
             "fetch('/desktop/session/token?desktop_client=1',{method:'POST',headers:{'" + DESKTOP_CLIENT_HEADER + "':'1','"
+            + ENFORCED_AUTO_LOGIN_HEADER + "':'" + ("1" if self.kerberos_enforced else "0") + "','"
             + CLIENT_OS_HEADER + "':'" + client_os_string() + "'}})"
             ".then(function(r){return r.ok?r.json():null;})"
             ".then(function(d){"
@@ -3754,6 +4881,16 @@ class ClientApp:
                 cur = self.current_url
             if not cur or cur == "about:blank" or not self.is_server_url(cur):
                 continue
+            if self.is_explicit_reauth_url(cur):
+                self.begin_explicit_reauth(window)
+                continue
+            if self.is_visible_receiver_login(cur):
+                # Treat a user-visible plain /login navigation as an upgrade
+                # before polling can read the old receiver-only browser cookie
+                # and send the user straight back to that session.
+                self.begin_explicit_reauth(window)
+                continue
+            reauth_upgrade_pending = self.explicit_reauth_active
             try:
                 raw = self._window_eval_js(script, window=window)
             except Exception:
@@ -3777,11 +4914,23 @@ class ClientApp:
                 old_identity = desktop_token_identity(self.token)
                 new_identity = desktop_token_identity(token)
                 changed_identity = not (old_identity[0] and new_identity[0] and old_identity == new_identity)
-                self.apply_session(session)
+                if reauth_upgrade_pending:
+                    self.explicit_reauth_active = False
+                    self.interactive_session_active = True
+                if not self.apply_session(session):
+                    try:
+                        self._window_eval_js(
+                            "window._opsTokenValue=null;window._opsTokenValueAt=0;",
+                            window=window,
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if reauth_upgrade_pending:
+                    self.apply_enforced_web_policy(window)
                 if current_path == "/login" or current_path.startswith("/login/"):
                     self.return_to_safe_main_url()
                 if changed_identity:
-                    self.pending_welcome = True
                     self.start_reconnect_loop()
                     try:
                         self._window_eval_js("window._opsTokenValue=null;window._opsTokenValueAt=0;", window=window)
@@ -3789,11 +4938,26 @@ class ClientApp:
                         pass
             elif token and (current_path == "/login" or current_path.startswith("/login/")):
                 self.return_to_safe_main_url()
-            elif not token and self.token and self.current_url and "/login" in self.current_url:
+            elif token and reauth_upgrade_pending:
+                self.explicit_reauth_active = False
+                self.interactive_session_active = True
+                self.session_provider = ""
+                self.persist_session_state()
+                self.apply_enforced_web_policy(window)
+            elif (
+                not token
+                and not reauth_upgrade_pending
+                and self.token
+                and self.current_url
+                and "/login" in self.current_url
+            ):
                 self.token = ""
                 self.refresh_token = ""
                 self.role = ""
                 self.user_id = None
+                self.session_provider = ""
+                self.interactive_session_active = False
+                self.session_expires_at = 0
                 self.persist_session_state()
                 self.refresh_tray()
                 if self.ws:
@@ -3802,6 +4966,7 @@ class ClientApp:
                     except Exception:
                         pass
                     self.ws = None
+                threading.Thread(target=self.try_kerberos_auto_login, daemon=True).start()
 
     def download_icon(self, broadcast_id, icon_name=""):
         if not broadcast_id:
@@ -3818,6 +4983,7 @@ class ClientApp:
         if priority == "emergency":
             state = self.audio.live_state()
             if str(state.get("broadcast_id") or "") != broadcast_id:
+                self.end_incoming_broadcast(state.get("broadcast_id"))
                 self.audio.stop()
         if broadcast_id:
             self.audio.register_broadcast(
@@ -3843,7 +5009,12 @@ class ClientApp:
             return
         if message.get("late"):
             return
-        self.flash_receiving()
+        audio_mode = str(message.get("audio_mode") or "").strip().lower()
+        live_audio = bool(
+            message.get("has_audio")
+            and audio_mode in {"live", "websocket", "mulaw", "ulaw"}
+        )
+        self.begin_incoming_broadcast(broadcast_id, live_audio=live_audio)
         shortmessage = str(message.get("shortmessage") or "").strip()
         longmessage = str(message.get("longmessage") or "").strip()
         has_audio = bool(message.get("has_audio"))
@@ -3875,7 +5046,9 @@ class ClientApp:
         self.audio.push_live_frame(str(broadcast_id or "").strip(), frame)
 
     def handle_audio_end(self, broadcast_id):
-        self.audio.end_live_stream(str(broadcast_id or "").strip())
+        broadcast_id = str(broadcast_id or "").strip()
+        self.audio.end_live_stream(broadcast_id)
+        self.end_incoming_broadcast(broadcast_id)
 
     def handle_high_priority(self, message):
         prev = 0
@@ -4029,6 +5202,10 @@ class ClientApp:
         self.hide_main_window()
         return False
 
+    def apply_enforced_web_policy(self, window=None):
+        # Enforced-mode controls are rendered and validated by the server.
+        return None
+
     def on_main_window_before_load(self, *args):
         if self.error_page_active:
             return True
@@ -4040,27 +5217,36 @@ class ClientApp:
             elif hasattr(arg, "get_current_url"):
                 window = arg
         if not url and window is not None:
-            # Never call window.get_current_url() here: before_load handlers
-            # run inline on the UI thread and get_current_url() blocks waiting
-            # for the "loaded" event that cannot fire until this handler
-            # returns, freezing the app ("Not Responding") for ~20 seconds.
             url = self._window_get_current_url(window=window)
+        if url and (
+            self.is_explicit_reauth_url(url)
+            or self.is_visible_receiver_login(url)
+        ):
+            # Mark the handoff before the login page can submit credentials.
+            # The successful login revokes the receiver-only server session,
+            # so an old-socket failure during this window must not trigger a
+            # fresh Automatic Login and overwrite the new browser session.
+            self.begin_explicit_reauth(window)
         if url and self.is_server_url(url):
             try:
                 parsed_url = urllib.parse.urlparse(url)
                 if parsed_url.path.rstrip("/") == "/desktop/app-settings":
                     self.open_app_settings()
-                    self.return_to_safe_main_url()
+                    self._deferred_return_to_safe_main_url()
+                    return False
+                if self.kerberos_enforced and parsed_url.path.rstrip("/").lower() == "/logout":
+                    threading.Thread(target=self.downgrade_to_automatic_login, daemon=True).start()
+                    self._deferred_return_to_safe_main_url()
                     return False
             except Exception:
                 pass
         if url and self.is_server_url(url) and self.is_sso_url(url):
             self.start_desktop_sso_flow()
-            self.return_to_safe_main_url()
+            self._deferred_return_to_safe_main_url()
             return False
         if url and not self.is_allowed_webview_url(url):
             self.open_in_default_browser(url)
-            self.return_to_safe_main_url()
+            self._deferred_return_to_safe_main_url()
             return False
         return True
 
@@ -4070,6 +5256,7 @@ class ClientApp:
         window = self.main_window
         if window is None:
             return
+        self.suppress_native_webview_error_ui(window)
         if not getattr(self, "_dpi_hook_installed", False):
             try:
                 _hook_dpi_changed(self.main_window_hwnd())
@@ -4083,18 +5270,42 @@ class ClientApp:
         self.current_url = current
         if current and not self.is_allowed_webview_url(current):
             self.open_in_default_browser(current)
-            self.return_to_safe_main_url()
+            self._deferred_return_to_safe_main_url()
             return
         if self.origin and self.is_server_url(current):
-            try:
-                self._window_eval_js(INJECT_JS, window=window)
-            except Exception:
-                pass
+            injection = INJECT_JS
+            threading.Thread(
+                target=self._window_eval_js,
+                args=(injection,),
+                kwargs={"window": window},
+                daemon=True,
+                name="WebViewPageInjection",
+            ).start()
             self.sync_web_session_in_webview()
+            try:
+                current_path = str(urllib.parse.urlparse(current).path or "").rstrip("/")
+            except Exception:
+                current_path = ""
+            if current_path == "/dashboard":
+                if self.session_provider == "kerberos":
+                    self.automatic_login_downgrade_pending = False
+                with self.auto_login_reveal_lock:
+                    reveal = self.auto_login_reveal_pending
+                    self.auto_login_reveal_pending = False
+                if reveal:
+                    self._window_show_restore(window=window)
+        with self.main_window_reveal_lock:
+            reveal_main = bool(
+                self.main_window_reveal_pending
+                and current
+                and self.is_server_url(current)
+            )
+            if reveal_main:
+                self.main_window_reveal_pending = False
+        if reveal_main:
+            self._window_show_restore(window=window)
 
     def start_show_event_listener(self):
-        # Waits for a second launch of the app (manual double-click or shortcut)
-        # to signal us, then restores/unminimizes the window from the tray.
         if not sys.platform.startswith("win"):
             return
         handle = self._show_event_handle
@@ -4111,9 +5322,9 @@ class ClientApp:
                 kernel32.WaitForSingleObject.restype = wintypes.DWORD
                 while not self.reconnect_stop.is_set():
                     result = kernel32.WaitForSingleObject(handle, 500)
-                    if result == 0:  # WAIT_OBJECT_0 - another instance asked us to show
+                    if result == 0:
                         threading.Thread(target=self.show_main_window, daemon=True).start()
-                    elif result not in (258,):  # anything other than WAIT_TIMEOUT means trouble
+                    elif result not in (258,):
                         break
             except Exception:
                 pass
@@ -4126,17 +5337,103 @@ class ClientApp:
         self.apply_native_icon(self.main_window)
         self.start_show_event_listener()
         threading.Thread(target=self.poll_web_session, daemon=True).start()
+        threading.Thread(target=self.kerberos_maintenance_loop, daemon=True).start()
         pending = getattr(self, "_pending_server", None)
         if pending:
             del self._pending_server
             threading.Thread(target=self.apply_server, args=pending, daemon=True).start()
             return
+        managed_retry = getattr(self, "_managed_server_retry", "")
+        if managed_retry:
+            del self._managed_server_retry
+
+            def retry_managed_server():
+                while not self.reconnect_stop.is_set():
+                    try:
+                        info, origin = probe_server(managed_retry)
+                    except Exception:
+                        if self.reconnect_stop.wait(15):
+                            return
+                        continue
+                    self.apply_server(managed_retry, info, origin)
+                    return
+
+            threading.Thread(target=retry_managed_server, daemon=True).start()
+            return
         if self.origin:
             self.start_reconnect_loop()
             self.refresh_tray()
-            threading.Thread(target=self.restore_session_after_restart, daemon=True).start()
-            if not self.start_minimized:
-                self.show_main_window("/")
+            def restore_and_auto_login():
+                self.refresh_server_capabilities()
+                kerberos_ready = self.try_kerberos_auto_login()
+                self.restore_session_after_restart()
+                if kerberos_ready and self.has_valid_enforced_session():
+                    self.prepare_auto_login_dashboard()
+                elif self.kerberos_enforced:
+                    self.show_kerberos_enforced_failure()
+                elif not self.start_minimized:
+                    self.show_main_window("/")
+
+            threading.Thread(target=restore_and_auto_login, daemon=True).start()
+
+
+def _webview2_secure_origin(url):
+    try:
+        parsed = urllib.parse.urlsplit(str(url or "").strip())
+        host = parsed.hostname
+        if parsed.scheme.lower() != "http" or not host:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    if ":" in host:
+        host = f"[{host}]"
+    else:
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            return None
+    if port and port != 80:
+        host = f"{host}:{port}"
+    return f"http://{host}"
+
+
+def _set_webview_permission(args, allow_state):
+    permission_kind = str(args.PermissionKind).rsplit(".", 1)[-1].lower()
+    if permission_kind == "microphone":
+        args.State = allow_state
+
+
+def _configure_webview_permissions(origin):
+    if sys.platform != "win32":
+        return
+    secure_origin = _webview2_secure_origin(origin)
+    if secure_origin:
+        browser_args = os.environ.get("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "")
+        permission_arg = f"--unsafely-treat-insecure-origin-as-secure={secure_origin}"
+        if permission_arg not in browser_args:
+            os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = " ".join(
+                part for part in (browser_args, permission_arg) if part
+            )
+    from webview.platforms import edgechromium
+    from Microsoft.Web.WebView2.Core import CoreWebView2PermissionState
+
+    edge_chrome = edgechromium.EdgeChrome
+    if getattr(edge_chrome, "_ops_microphone_permission_hook", False):
+        return
+    original_on_webview_ready = edge_chrome.on_webview_ready
+
+    def on_permission_requested(self, _sender, args):
+        _set_webview_permission(args, CoreWebView2PermissionState.Allow)
+
+    def on_webview_ready(self, sender, args):
+        if args.IsSuccess:
+            sender.CoreWebView2.PermissionRequested += self.on_permission_requested
+        original_on_webview_ready(self, sender, args)
+
+    edge_chrome.on_permission_requested = on_permission_requested
+    edge_chrome.on_webview_ready = on_webview_ready
+    edge_chrome._ops_microphone_permission_hook = True
 
 
 def _enable_high_dpi_awareness():
@@ -4154,13 +5451,11 @@ def _enable_high_dpi_awareness():
     if platform.system() != "Windows":
         return
     try:
-        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4 (Windows 10 1703+).
         if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
             return
     except (AttributeError, OSError):
         pass
     try:
-        # PROCESS_PER_MONITOR_DPI_AWARE = 2 (Windows 8.1+).
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
         return
     except (AttributeError, OSError):
@@ -4173,12 +5468,14 @@ def _enable_high_dpi_awareness():
 
 def main():
     _enable_high_dpi_awareness()
-    autostart = launched_at_startup()
+    background = launched_at_startup()
     is_primary, mutex_handle = _acquire_single_instance()
     if not is_primary:
-        # Another instance is already running: ask it to surface its window
-        # (item 4 - clicking the exe while running unminimizes from the tray).
-        signal_existing_instance()
+        # Duplicate Run entries can race at sign-in. A background copy must
+        # exit silently; only an intentional foreground launch opens the
+        # already-running client's window.
+        if not background:
+            signal_existing_instance()
         return
     _SINGLE_INSTANCE_HANDLES.append(mutex_handle)
     show_event_handle = create_show_event()
@@ -4189,12 +5486,19 @@ def main():
     except Exception:
         pass
     app = ClientApp()
-    app.launched_at_startup = autostart
+    app.launched_at_startup = background
     app._show_event_handle = show_event_handle
-    # Start minimized (to tray) only when launched at startup AND already logged in
-    # and configured to connect to a server. Otherwise start "loudly" (visible),
-    # and manual launches always show the window.
-    app.start_minimized = bool(autostart and app.origin and app.token)
+    managed_server = str(app.policies.get("server_address") or "").strip()
+    if managed_server and not app.origin:
+        # Never probe the network on the launch thread. A missing/offline
+        # managed server used to hold startup here for every candidate port,
+        # which made background launches look frozen before the tray existed.
+        app.origin = server_address_candidates(managed_server)[0]
+        app.config.update({"server": app.origin, "server_input": managed_server})
+        save_config(app.config)
+        app.pending_welcome = not bool(app.config.get("initial_connection_notice_shown"))
+        app._managed_server_retry = managed_server
+    app.start_minimized = bool(background)
     if not app.origin:
         result = run_on_tk_thread(lambda: ServerAddressDialog(app).run())
         if result:
@@ -4203,6 +5507,10 @@ def main():
         else:
             app.quit()
             return
+    pending_server = getattr(app, "_pending_server", None)
+    _configure_webview_permissions(
+        app.origin or (pending_server[2] if pending_server else "")
+    )
     window = webview.create_window(
         app.product_name,
         url="about:blank",

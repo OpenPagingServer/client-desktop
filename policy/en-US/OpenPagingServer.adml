@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitionResources revision="1.0" schemaVersion="1.0">
+  <displayName>Open Paging Server policy settings</displayName>
+  <description>Policy settings for the Open Paging Server Desktop Client.</description>
+  <resources>
+    <stringTable>
+      <string id="SUPPORTED_Windows10">Windows 10 or later</string>
+      <string id="OpenPagingServer">Open Paging Server</string>
+      <string id="DesktopClient">Desktop Client</string>
+      <string id="ServerAddress">Set server address</string>
+      <string id="ServerAddress_Help">Sets the Open Paging Server address. If set, users cannot disconnect from the server.</string>
+      <string id="RequireUAC">Require UAC for App Settings</string>
+      <string id="RequireUAC_Help">Controls whether opening App Settings requires administrator approval.</string>
+      <string id="LaunchAtStartup">Launch at startup</string>
+      <string id="LaunchAtStartup_Help">Controls whether the desktop client launches when the user signs in.</string>
+      <string id="KerberosAutoLogin">Automatic Login</string>
+      <string id="KerberosAutoLogin_Help">Controls support for automatic login of domain users to their Open Paging Server account. Automatic Login must be configured in Open Paging Server with your domain controller or Intune under System Settings &gt; Identity.</string>
+      <string id="KerberosDisabled">Disabled</string>
+      <string id="KerberosAllowed">Allowed</string>
+      <string id="KerberosEnforced">Enforced</string>
+    </stringTable>
+    <presentationTable>
+      <presentation id="ServerAddress">
+        <textBox refId="ServerAddressValue">
+          <label>Server address:</label>
+        </textBox>
+      </presentation>
+      <presentation id="RequireUAC">
+        <checkBox refId="RequireUACValue">Require administrator approval</checkBox>
+      </presentation>
+      <presentation id="LaunchAtStartup">
+        <checkBox refId="LaunchAtStartupValue">Launch when the user signs in</checkBox>
+      </presentation>
+      <presentation id="KerberosAutoLogin">
+        <dropdownList refId="KerberosAutoLoginValue" defaultItem="1">Automatic Login mode:</dropdownList>
+      </presentation>
+    </presentationTable>
+  </resources>
+</policyDefinitionResources>

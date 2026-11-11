@@ -1,7 +1,9 @@
 import base64
+import sys
 import tempfile
 from pathlib import Path
 
+sys.path.insert(0, str(Path.cwd()))
 import embedded_assets
 
 block_cipher = None
@@ -14,7 +16,15 @@ a = Analysis(
     pathex=["."],
     binaries=[],
     datas=[],
-    hiddenimports=["pystray._win32", "miniaudio", "windows_toasts"],
+    hiddenimports=[
+        "pystray._win32",
+        "miniaudio",
+        "windows_toasts",
+        "sspi",
+        "sspicon",
+        "win32security",
+        "win32timezone",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -33,7 +43,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="OpenPagingServerDesktop",
+    name="OpenPagingServerClient",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

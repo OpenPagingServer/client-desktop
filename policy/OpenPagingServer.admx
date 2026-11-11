@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<policyDefinitions revision="1.0" schemaVersion="1.0">
+  <policyNamespaces>
+    <target prefix="ops" namespace="OpenPagingServer.Policies" />
+    <using prefix="windows" namespace="Microsoft.Policies.Windows" />
+  </policyNamespaces>
+  <resources minRequiredRevision="1.0" />
+  <supportedOn>
+    <definitions>
+      <definition name="SUPPORTED_Windows10" displayName="$(string.SUPPORTED_Windows10)" />
+    </definitions>
+  </supportedOn>
+  <categories>
+    <category name="OpenPagingServer" displayName="$(string.OpenPagingServer)" />
+    <category name="DesktopClient" displayName="$(string.DesktopClient)">
+      <parentCategory ref="OpenPagingServer" />
+    </category>
+  </categories>
+  <policies>
+    <policy name="ServerAddress" class="Both" displayName="$(string.ServerAddress)" explainText="$(string.ServerAddress_Help)" presentation="$(presentation.ServerAddress)" key="Software\Policies\OpenPagingServer\DesktopClient">
+      <parentCategory ref="DesktopClient" />
+      <supportedOn ref="SUPPORTED_Windows10" />
+      <elements>
+        <text id="ServerAddressValue" valueName="ServerAddress" required="true" />
+      </elements>
+    </policy>
+    <policy name="RequireUAC" class="Both" displayName="$(string.RequireUAC)" explainText="$(string.RequireUAC_Help)" presentation="$(presentation.RequireUAC)" key="Software\Policies\OpenPagingServer\DesktopClient">
+      <parentCategory ref="DesktopClient" />
+      <supportedOn ref="SUPPORTED_Windows10" />
+      <elements>
+        <boolean id="RequireUACValue" valueName="RequireUAC">
+          <trueValue><decimal value="1" /></trueValue>
+          <falseValue><decimal value="0" /></falseValue>
+        </boolean>
+      </elements>
+    </policy>
+    <policy name="LaunchAtStartup" class="Both" displayName="$(string.LaunchAtStartup)" explainText="$(string.LaunchAtStartup_Help)" presentation="$(presentation.LaunchAtStartup)" key="Software\Policies\OpenPagingServer\DesktopClient">
+      <parentCategory ref="DesktopClient" />
+      <supportedOn ref="SUPPORTED_Windows10" />
+      <elements>
+        <boolean id="LaunchAtStartupValue" valueName="LaunchAtStartup">
+          <trueValue><decimal value="1" /></trueValue>
+          <falseValue><decimal value="0" /></falseValue>
+        </boolean>
+      </elements>
+    </policy>
+    <policy name="KerberosAutoLogin" class="Both" displayName="$(string.KerberosAutoLogin)" explainText="$(string.KerberosAutoLogin_Help)" presentation="$(presentation.KerberosAutoLogin)" key="Software\Policies\OpenPagingServer\DesktopClient">
+      <parentCategory ref="DesktopClient" />
+      <supportedOn ref="SUPPORTED_Windows10" />
+      <elements>
+        <enum id="KerberosAutoLoginValue" valueName="KerberosAutoLogin" required="true">
+          <item displayName="$(string.KerberosDisabled)"><value><decimal value="0" /></value></item>
+          <item displayName="$(string.KerberosAllowed)"><value><decimal value="1" /></value></item>
+          <item displayName="$(string.KerberosEnforced)"><value><decimal value="2" /></value></item>
+        </enum>
+      </elements>
+    </policy>
+  </policies>
+</policyDefinitions>
